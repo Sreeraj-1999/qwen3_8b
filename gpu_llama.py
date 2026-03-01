@@ -1,4 +1,8 @@
 import warnings
+import logging
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 warnings.filterwarnings("ignore", category=FutureWarning, module="insightface.utils.transform", message=".*rcond.*")
@@ -6,6 +10,24 @@ warnings.filterwarnings("ignore", message=".*Quadro P400.*")
 warnings.filterwarnings("ignore", message=".*cuda capability.*")
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 warnings.filterwarnings("ignore", message=".*Please install PyTorch.*")
+
+logger.info("Loading GGUF model for LLM operations...")
+
+from llama_cpp import Llama
+
+GGUF_MODEL_PATH = r"C:\Users\User\Desktop\siemens\PROJECT5D\test\qwen3_marine_Q4_K_M.gguf"
+
+llm = Llama(
+    model_path=GGUF_MODEL_PATH,
+    n_ctx=4096,
+    n_gpu_layers=99,
+    main_gpu=0,
+    cache_type_k="q8_0",
+    cache_type_v="q8_0",
+    verbose=False,
+)
+
+logger.info("GGUF model loaded successfully")
 
 # Clear comtypes cache BEFORE importing comtypes
 import shutil
@@ -21,15 +43,12 @@ if os.path.exists(cache_dir):
         print(f"Could not clear cache: {e}")
 
 # Now import everything else
-from flask import Flask, request, jsonify,Response
+from flask import Flask, request, jsonify, Response
 import queue
 import threading
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-# from mcp_tool_handler import TELEMETRY_TOOLS, execute_tool_call, parse_tool_call, needs_tool_call
 from mcp_tool_handler import TELEMETRY_TOOLS, PMS_TOOLS, ALL_TOOLS, execute_tool_call, parse_tool_call, needs_tool_call
-from peft import PeftModel
-import logging
+
 import soundfile as sf
 import io
 import pickle
@@ -43,16 +62,14 @@ import base64
 from scipy.signal import resample
 import whisper
 import sys
-import contextlib 
-import cv2 
+import contextlib
+import cv2
 from embedding_service import embedding_service
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+
 
 # Initialize Flask app for GPU operations
 app = Flask('gpu_service')
@@ -78,40 +95,18 @@ with suppress_stdout_stderr():
     face_app = FaceAnalysis(name='buffalo_l', providers=['CUDAExecutionProvider'])
     face_app.prepare(ctx_id=0)
 
-logger.info("Loading deepseek model for LLM operations...")
-
-# LLM MODEL SETUP
-MODEL_NAME = "Qwen/Qwen3-8B"
-SAVED_MODEL_PATH = r"C:\Users\User\Desktop\siemens\OFFSHORE\qwen3_marine_final_v3"
+# ==============================================================================
+# LLM MODEL SETUP — GGUF via llama-cpp-python (replaces transformers + QLoRA)
+# ==============================================================================
 
 
-tokenizer = AutoTokenizer.from_pretrained(
-    SAVED_MODEL_PATH, 
-    trust_remote_code=True,
-)
+# We still need the tokenizer for apply_chat_template (building prompts)
+from transformers import AutoTokenizer
+
+TOKENIZER_PATH = r"C:\Users\User\Desktop\siemens\OFFSHORE\qwen3_marine_final_v3"
+tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
 tokenizer.eos_token = "<|im_end|>"
 tokenizer.pad_token = tokenizer.eos_token
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_use_double_quant=True,
-    # bnb_4bit_compute_dtype=torch.float16
-    bnb_4bit_compute_dtype=torch.bfloat16
-)
-
-base_model = AutoModelForCausalLM.from_pretrained(
-    MODEL_NAME,
-    # torch_dtype=torch.float16,
-    torch_dtype=torch.bfloat16,
-    device_map={"": 0},
-    trust_remote_code=True,
-    quantization_config=bnb_config,
-    local_files_only=True
-)
-
-model = PeftModel.from_pretrained(base_model, SAVED_MODEL_PATH)
-model.eval()
 
 # Load Whisper model (GPU)
 whisper_model = whisper.load_model("small").to("cuda")
@@ -191,6 +186,46 @@ def relative_wind_direction(wind_direction, ship_heading):
     return np.mod(relative_direction + 360, 360)
 
 
+# ==============================================================================
+# HELPER: Generate response from GGUF model
+# ==============================================================================
+def gguf_generate(prompt, max_tokens=1024, temperature=0.1, stop=None):
+    """Generate text from GGUF model. Returns the generated text."""
+    if stop is None:
+        stop = ["<|im_end|>", "<|endoftext|>"]
+    
+    output = llm(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=0.8,
+        top_k=20,
+        repeat_penalty=1.2,
+        stop=stop,
+    )
+    return output["choices"][0]["text"]
+
+
+def gguf_stream(prompt, max_tokens=1024, temperature=0.1, stop=None):
+    """Stream text from GGUF model. Yields chunks."""
+    if stop is None:
+        stop = ["<|im_end|>", "<|endoftext|>"]
+    
+    stream = llm(
+        prompt,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=0.95,
+        top_k=20,
+        repeat_penalty=1.2,
+        stop=stop,
+        stream=True,
+    )
+    for chunk in stream:
+        token = chunk["choices"][0]["text"]
+        if token:
+            yield token
+
 
 @app.route('/gpu/llm/generate', methods=['POST'])
 def generate_llm_response():
@@ -212,12 +247,6 @@ def generate_llm_response():
         # Tools always available based on context
         tools = ALL_TOOLS if imo else PMS_TOOLS
 
-        # If conversation history exists, extract it from messages and inject
-        # as a compact block inside the system prompt. This way:
-        # 1) Tools stay available for every turn
-        # 2) History is visible to the model inside the system prompt (high attention area)
-        # 3) Only the current user question remains as the actual user message
-        
         # Separate system msg, history msgs, and current user msg
         system_msg = None
         history_msgs = []
@@ -236,33 +265,25 @@ def generate_llm_response():
             history_text = "\n\n=== CONVERSATION HISTORY (use this for follow-up questions) ===\n"
             for h in history_msgs:
                 role_label = "User" if h['role'] == 'user' else "Assistant"
-                # Truncate long assistant responses in history to save tokens
                 content = h['content'][:300] + "..." if len(h['content']) > 300 else h['content']
                 history_text += f"{role_label}: {content}\n"
             history_text += "=== END HISTORY ===\n"
             system_msg['content'] += history_text
             
-            # Rebuild messages: just system + current user (history is now in system prompt)
             messages = [system_msg, current_user_msg]
         
         logger.info(f"=== PROMPT: {len(messages)} msgs, tools={'yes' if tools else 'no'}, history={len(history_msgs)} msgs ===")
 
+        # Build prompt using tokenizer's chat template
         text = tokenizer.apply_chat_template(
             messages, tokenize=False,
             add_generation_prompt=True,
             enable_thinking=enable_thinking,
             tools=tools
         )
-        inputs = tokenizer(text, return_tensors="pt").to(model.device)
 
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs, max_new_tokens=1024,
-                temperature=0.1, top_p=0.8, top_k=20,
-                do_sample=True, repetition_penalty=1.2,
-            )
-
-        response = tokenizer.decode(outputs[0][inputs['input_ids'].shape[1]:], skip_special_tokens=False)
+        # Generate with GGUF
+        response = gguf_generate(text, max_tokens=1024, temperature=0.1)
 
         # Tool call loop (max 1 round)
         if "<tool_call>" in response:
@@ -286,15 +307,8 @@ def generate_llm_response():
                     messages, tokenize=False,
                     add_generation_prompt=True, enable_thinking=False
                 )
-                inputs2 = tokenizer(text2, return_tensors="pt").to(model.device)
 
-                with torch.no_grad():
-                    outputs2 = model.generate(
-                        **inputs2, max_new_tokens=1024,
-                        temperature=0.1, top_p=0.8, top_k=20,
-                        do_sample=True, repetition_penalty=1.2,
-                    )
-                response = tokenizer.decode(outputs2[0][inputs2['input_ids'].shape[1]:], skip_special_tokens=False)
+                response = gguf_generate(text2, max_tokens=1024, temperature=0.1)
 
         # Clean
         if "</think>" in response:
@@ -305,9 +319,9 @@ def generate_llm_response():
 
     except Exception as e:
         logger.error(f"Error in LLM generation: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
-    finally:
-        torch.cuda.empty_cache()
 
 
 @app.route('/gpu/llm/stream', methods=['POST'])
@@ -322,11 +336,7 @@ def stream_llm_response():
         
         def generate():
             try:
-                from transformers import TextIteratorStreamer
-                
                 # --- Same history handling as /generate ---
-                # Bake history into system prompt so it's visible alongside thinking
-                
                 system_msg = None
                 history_msgs = []
                 current_user_msg = None
@@ -354,7 +364,7 @@ def stream_llm_response():
                 
                 logger.info(f"=== STREAM PROMPT: {len(final_messages)} msgs, history={len(history_msgs)} msgs ===")
 
-                # Qwen3 chat template — thinking enabled for streaming
+                # Build prompt with thinking enabled
                 text = tokenizer.apply_chat_template(
                     final_messages,
                     tokenize=False,
@@ -362,56 +372,56 @@ def stream_llm_response():
                     enable_thinking=True
                 )
 
-                inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-                streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=False)
-
-                generation_kwargs = dict(
-                    **inputs,
-                    max_new_tokens=1024,
-                    temperature=0.1,
-                    top_p=0.95,
-                    top_k=20,
-                    do_sample=True,
-                    repetition_penalty=1.2,
-                    streamer=streamer
-                )
-
-                thread = threading.Thread(target=model.generate, kwargs=generation_kwargs)
-                thread.start()
-
+                # Stream from GGUF
                 in_thinking = True
+                buffer = ""
 
-                for new_text in streamer:
-                    new_text = new_text.replace("<think>", "").replace("<|im_start|>", "")
-                    if "<|im_end|>" in new_text:
-                        clean_text = new_text.replace("<|im_end|>", "")
-                        if clean_text.strip():
-                            msg_type = 'thinking' if in_thinking else 'answer'
-                            yield f"data: {json.dumps({'type': msg_type, 'content': clean_text})}\n\n"
-                        break
-
-                    if "</think>" in new_text:
-                        parts = new_text.split("</think>")
-                        if parts[0]:
-                            yield f"data: {json.dumps({'type': 'thinking', 'content': parts[0]})}\n\n"
+                for token in gguf_stream(text, max_tokens=1024, temperature=0.1):
+                    buffer += token
+                    
+                    # Process buffer for think/answer transitions
+                    if in_thinking and "</think>" in buffer:
+                        parts = buffer.split("</think>", 1)
+                        # Send remaining thinking content
+                        think_content = parts[0].replace("<think>", "")
+                        if think_content:
+                            yield f"data: {json.dumps({'type': 'thinking', 'content': think_content})}\n\n"
                         in_thinking = False
-                        if len(parts) > 1 and parts[1]:
-                            yield f"data: {json.dumps({'type': 'answer', 'content': parts[1]})}\n\n"
+                        buffer = parts[1] if len(parts) > 1 else ""
+                        # Send any answer content after </think>
+                        if buffer:
+                            yield f"data: {json.dumps({'type': 'answer', 'content': buffer})}\n\n"
+                            buffer = ""
                     elif in_thinking:
-                        if new_text:
-                            yield f"data: {json.dumps({'type': 'thinking', 'content': new_text})}\n\n"
+                        # Stream thinking tokens (but wait for enough to avoid partial tags)
+                        safe = buffer.replace("<think>", "")
+                        # Keep last 10 chars in buffer in case </think> is split across tokens
+                        if len(safe) > 10:
+                            send = safe[:-10]
+                            buffer = "<think>" + safe[-10:] if "<think>" in buffer else safe[-10:]
+                            if send:
+                                yield f"data: {json.dumps({'type': 'thinking', 'content': send})}\n\n"
                     else:
-                        if new_text:
-                            yield f"data: {json.dumps({'type': 'answer', 'content': new_text})}\n\n"
+                        # Answer mode — stream directly
+                        clean = buffer.replace("<|im_end|>", "").replace("<|im_start|>", "")
+                        if clean:
+                            yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+                        buffer = ""
+                
+                # Flush remaining buffer
+                if buffer:
+                    clean = buffer.replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "").replace("<|im_start|>", "")
+                    if clean.strip():
+                        msg_type = 'thinking' if in_thinking else 'answer'
+                        yield f"data: {json.dumps({'type': msg_type, 'content': clean})}\n\n"
 
-                thread.join()
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 
             except Exception as e:
+                logger.error(f"Stream generation error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
                 yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
-            finally:
-                torch.cuda.empty_cache()
         
         return Response(generate(), mimetype='text/event-stream')
         
@@ -423,10 +433,6 @@ def stream_llm_response():
 def transcribe_audio():
     """Transcribe audio using Whisper model"""
     try:
-        # if 'audio' not in request.files:
-        #     return jsonify({'error': 'No audio file provided'}), 400     changed for app
-        
-        # audio_file = request.files['audio']
         audio_file = request.files.get('audio') or request.files.get('file')
         if not audio_file:
             return jsonify({'error': 'No audio file provided'}), 400
@@ -499,20 +505,16 @@ def text_to_speech():
             # Initialize COM for this thread
             CoInitialize()
             
-            # CRITICAL FIX: Get the proper gen directory path
             import comtypes.gen
             import comtypes
             
-            # Try to get the directory path properly
             try:
                 if hasattr(comtypes.gen, '__file__') and comtypes.gen.__file__ is not None:
                     gen_dir = os.path.dirname(comtypes.gen.__file__)
                 else:
-                    # Fallback: construct path from comtypes location
                     comtypes_path = os.path.dirname(comtypes.__file__)
                     gen_dir = os.path.join(comtypes_path, 'gen')
                 
-                # Ensure directory exists
                 if os.path.exists(gen_dir):
                     cache_files = [f for f in os.listdir(gen_dir) 
                                  if f.startswith('_') and f.endswith('.py')]
@@ -528,18 +530,14 @@ def text_to_speech():
             except Exception as e:
                 logger.warning(f"Could not clear cache: {e}")
             
-            # Now generate the typelib
             from comtypes.client import GetModule
             GetModule("C:\\Windows\\System32\\Speech\\Common\\sapi.dll")
             
-            # Import the generated library
             from comtypes.gen import SpeechLib
             
-            # Create COM objects
             engine = CreateObject("SAPI.SpVoice")
             stream = CreateObject("SAPI.SpFileStream")
 
-            # Select English voice
             voices = engine.GetVoices()
             for i in range(voices.Count):
                 voice = voices.Item(i)
@@ -549,19 +547,16 @@ def text_to_speech():
                     logger.info(f"Selected voice: {voice_name}")
                     break
 
-            # Open stream and generate speech
             stream.Open(temp_wav_path, SpeechLib.SSFMCreateForWrite)
             engine.AudioOutputStream = stream
             engine.Rate = 1
             engine.Speak(text)
             stream.Close()
 
-            # Convert WAV to MP3
             from pydub import AudioSegment
             audio = AudioSegment.from_wav(temp_wav_path)
             audio.export(temp_mp3_path, format="mp3")
 
-            # Read and encode MP3
             with open(temp_mp3_path, 'rb') as f:
                 audio_data = f.read()
                 audio_blob = base64.b64encode(audio_data).decode('utf-8')
@@ -582,7 +577,6 @@ def text_to_speech():
                 CoUninitialize()
             except:
                 pass
-            # Cleanup temp files
             for path in [temp_wav_path, temp_mp3_path]:
                 try:
                     if os.path.exists(path):
@@ -606,31 +600,26 @@ def compare_faces():
         image_file1 = request.files['image']
         image_file2 = request.files['profilePicture']
 
-        # Read images
         image1 = cv2.imdecode(np.frombuffer(image_file1.read(), np.uint8), cv2.IMREAD_COLOR)
         image2 = cv2.imdecode(np.frombuffer(image_file2.read(), np.uint8), cv2.IMREAD_COLOR)
 
         if image1 is None or image2 is None:
             return jsonify({'error': 'Invalid image format'}), 400
 
-        # Get face embeddings
         faces1 = face_app.get(image1)
         faces2 = face_app.get(image2)
 
         if not faces1 or not faces2:
             return jsonify({'error': 'No face detected'}), 400
 
-        # Use first detected face
         encoding1 = faces1[0].embedding
         encoding2 = faces2[0].embedding
 
-        # Normalize embeddings
         encoding1 = encoding1 / np.linalg.norm(encoding1)
         encoding2 = encoding2 / np.linalg.norm(encoding2)
 
-        # Compute similarity
         cosine_similarity = np.dot(encoding1, encoding2)
-        similarity = (cosine_similarity + 1) / 2  # Scale to [0, 1]
+        similarity = (cosine_similarity + 1) / 2
 
         logger.info(f"Face similarity: {similarity:.4f}")
         
@@ -658,21 +647,18 @@ def fuel_analysis():
         if not fuel_payload:
             return jsonify({'error': 'No fuel payload provided'}), 400
 
-        # Extract ship IMO
         imo_number = fuel_payload.get('IMO')
         if not imo_number:
             return jsonify({'error': 'IMO is required'}), 400
         
         ship_id = f"IMO{imo_number}" 
         
-        # Load ship-specific model
         try:
             fuel_model, scaler_X, scaler_y, pca_X, device = load_ship_model(ship_id)
             logger.info("Fuel model loaded successfully")
         except FileNotFoundError as e:
             return jsonify({'error': str(e)}), 404
         
-        # Extract input values
         sog = fuel_payload.get('V_SOG_act_kn@AVG')
         stw = fuel_payload.get('V_STW_act_kn@AVG')
         rpm = fuel_payload.get('SA_SPD_act_rpm@AVG')
@@ -683,17 +669,14 @@ def fuel_analysis():
         ship_heading = fuel_payload.get('V_HDG_act_deg@AVG')
         wind_speed = fuel_payload.get('WEA_WST_act_kn@AVG')
         
-        # Check for missing values
         required_fields = [sog, stw, rpm, torque, power, wind_direction, ship_heading, wind_speed]
         if any(x is None for x in required_fields):
             return jsonify({'error': 'Missing required input fields'}), 400
         
-        # Calculate effective wind speed
         rel_wind_dir = relative_wind_direction(wind_direction, ship_heading)
         rel_wind_cos = np.cos(np.radians(rel_wind_dir))
         effective_wind_speed = wind_speed * rel_wind_cos
         
-        # Prepare input data
         input_data = pd.DataFrame({
             'V_SOG_act_kn@AVG': [sog],
             'V_STW_act_kn@AVG': [stw], 
@@ -703,17 +686,14 @@ def fuel_analysis():
             'SA_POW_act_kW@AVG': [power]
         })
         
-        # Preprocess
         X_scaled = scaler_X.transform(input_data)
         X_pca = pca_X.transform(X_scaled)
         X_tensor = torch.tensor(X_pca, dtype=torch.float32).to(device)
         
-        # Predict
         with torch.no_grad():
             y_pred_scaled = fuel_model(X_tensor).cpu().numpy().flatten()
         predicted_fuel = scaler_y.inverse_transform(y_pred_scaled.reshape(-1, 1)).flatten()[0]
         
-        # Alert logic
         alert = False
         if actual_fuel is not None and actual_fuel > 0:
             percentage_diff = abs(predicted_fuel - actual_fuel) / actual_fuel * 100
@@ -753,7 +733,7 @@ def health_check():
             'gpu_available': gpu_available,
             'gpu_memory_gb': round(gpu_memory / (1024**3), 2) if gpu_memory else 0,
             'models_loaded': {
-                'llm': model is not None,
+                'llm': llm is not None,
                 'whisper': whisper_model is not None,
                 'face_recognition': face_app is not None
             }
@@ -763,6 +743,5 @@ def health_check():
 
 # ============= STARTUP =============
 if __name__ == '__main__':
-    logger.info("Starting GPU Service...")
-    # Use a different port than main FastAPI app
+    logger.info("Starting GPU Service (GGUF mode)...")
     app.run(host='0.0.0.0', port=5005, debug=False)

@@ -1,12 +1,9 @@
 """
 Tool Call Handler for gpu_service.py
 =====================================
-Add this to gpu_service.py to handle Qwen3 tool calls.
-
-When Qwen3 generates a <tool_call> in its response, this module:
-1. Parses the tool call
-2. Sends it to the MCP telemetry server (port 5010)
-3. Returns the result back to Qwen3 for final answer generation
+Routes Qwen3 tool calls to the correct MCP server:
+  - Telemetry tools (5) → port 5010 (mcp_telemetry.py)
+  - PMS tools (8)       → port 5011 (mcp_pms.py)
 """
 
 import json
@@ -15,9 +12,13 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-MCP_SERVER_URL = "http://localhost:5010"
+MCP_TELEMETRY_URL = "http://localhost:5010"
+MCP_PMS_URL = "http://localhost:5011"
 
-# Tool definitions — pass these to Qwen3 via apply_chat_template(tools=TOOLS)
+# ============================================================
+# TELEMETRY TOOL DEFINITIONS (5 tools)
+# ============================================================
+
 TELEMETRY_TOOLS = [
     {
         "type": "function",
@@ -101,26 +102,191 @@ TELEMETRY_TOOLS = [
     }
 ]
 
+# ============================================================
+# PMS TOOL DEFINITIONS (8 tools)
+# ============================================================
+
+PMS_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_equipment",
+            "description": "Search the vessel equipment registry. Find equipment by name, code, maker, type, department, or location.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string", "description": "Search keyword (e.g., 'turbocharger', 'boiler', 'pump', 'MAN')"},
+                    "field": {"type": "string", "enum": ["all", "equipment_name", "equipment_code", "maker", "equipment_type", "department", "location"], "description": "Which field to search. Use 'all' for general search."},
+                    "limit": {"type": "integer", "description": "Max results (default: 20)"}
+                },
+                "required": ["search_term"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_maintenance_schedule",
+            "description": "Get planned/scheduled maintenance jobs. Shows job title, frequency, job type, next due date, remaining days. Use for maintenance schedule, planned jobs, inspections due.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string", "description": "Equipment name or code (e.g., 'turbocharger', '651.053')"},
+                    "job_type": {"type": "string", "enum": ["all", "INSPECTION", "TESTING", "OVERHAUL", "SERVICE", "MAINTENANCE", "CALIBRATION", "REPLACEMENT"], "description": "Filter by job type"},
+                    "critical_only": {"type": "boolean", "description": "Only safety-critical jobs"},
+                    "limit": {"type": "integer", "description": "Max results (default: 20)"}
+                },
+                "required": ["search_term"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_pending_jobs",
+            "description": "Get pending/due/overdue maintenance jobs with due dates, priority, and status.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string", "description": "Equipment name/code, or 'all' for all pending jobs"},
+                    "priority": {"type": "string", "enum": ["all", "URGENT", "HIGH", "NORMAL", "LOW"], "description": "Filter by priority"},
+                    "overdue_only": {"type": "boolean", "description": "Only show overdue jobs"},
+                    "limit": {"type": "integer", "description": "Max results (default: 30)"}
+                },
+                "required": ["search_term"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job_history",
+            "description": "Get completed maintenance history. Shows what was done, when, job reports, condition after, who did it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string", "description": "Equipment name or code (e.g., 'main engine', '551.001')"},
+                    "limit": {"type": "integer", "description": "Max results (default: 20)"}
+                },
+                "required": ["search_term"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_running_hours",
+            "description": "Get equipment running hour readings and trends over time.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string", "description": "Equipment name or code"},
+                    "latest_only": {"type": "boolean", "description": "Only latest reading per equipment"},
+                    "limit": {"type": "integer", "description": "Max results (default: 20)"}
+                },
+                "required": ["search_term"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_spare_parts",
+            "description": "Search spare parts inventory. Shows stock levels (ROB), min stock, reorder levels, mapped equipment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "search_term": {"type": "string", "description": "Part name or equipment (e.g., 'gasket', 'bearing', 'turbocharger')"},
+                    "low_stock_only": {"type": "boolean", "description": "Only parts where ROB <= minimum stock"},
+                    "equipment_code": {"type": "string", "description": "Filter by equipment code"},
+                    "limit": {"type": "integer", "description": "Max results (default: 25)"}
+                },
+                "required": ["search_term"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_maintenance_summary",
+            "description": "High-level PMS dashboard: counts of pending, completed, overdue jobs, low-stock spares, critical items.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "include_details": {"type": "boolean", "description": "Include lists of overdue jobs and low-stock parts"}
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_equipment_full_status",
+            "description": "COMPLETE equipment status: details + scheduled maintenance + pending jobs + history + running hours + spare parts in one call.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "equipment_code": {"type": "string", "description": "Equipment code (e.g., '651.053')"},
+                    "equipment_name": {"type": "string", "description": "Equipment name if code unknown"}
+                },
+                "required": []
+            }
+        }
+    }
+]
+
+# ============================================================
+# COMBINED TOOLS + ROUTING
+# ============================================================
+
+ALL_TOOLS = TELEMETRY_TOOLS + PMS_TOOLS
+
+PMS_TOOL_NAMES = {
+    "search_equipment", "get_maintenance_schedule", "get_pending_jobs",
+    "get_job_history", "get_running_hours", "search_spare_parts",
+    "get_maintenance_summary", "get_equipment_full_status"
+}
+
+TELEMETRY_TOOL_NAMES = {
+    "get_latest_readings", "get_active_alarms", "get_sensor_history",
+    "get_generator_status", "query_telemetry"
+}
+
 
 def execute_tool_call(tool_name: str, arguments: dict) -> str:
-    """Send tool call to MCP server and return result as string"""
+    """Route tool call to the correct MCP server"""
     try:
+        if tool_name in PMS_TOOL_NAMES:
+            url = f"{MCP_PMS_URL}/mcp/call"
+            server_label = "PMS"
+        elif tool_name in TELEMETRY_TOOL_NAMES:
+            url = f"{MCP_TELEMETRY_URL}/mcp/call"
+            server_label = "Telemetry"
+        else:
+            return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        
+        logger.info(f"Routing {tool_name} → {server_label} server")
+        
         response = requests.post(
-            f"{MCP_SERVER_URL}/mcp/call",
+            url,
             json={"name": tool_name, "arguments": arguments},
             timeout=30
         )
         result = response.json()
         
-        # Truncate large data arrays to avoid token overflow
-        if "data" in result and isinstance(result["data"], list) and len(result["data"]) > 20:
-            result["data"] = result["data"][:20]
-            result["_truncated"] = f"Showing 20 of {len(result['data'])} records"
+        # Truncate large arrays to avoid token overflow
+        for key in list(result.keys()):
+            if isinstance(result[key], list) and len(result[key]) > 20:
+                total = len(result[key])
+                result[key] = result[key][:20]
+                result[f"_{key}_note"] = f"Showing 20 of {total} records"
         
         return json.dumps(result, indent=2)
     
     except requests.exceptions.ConnectionError:
-        return json.dumps({"error": "MCP telemetry server not running. Start it with: python mcp_telemetry.py"})
+        server = "PMS (port 5011)" if tool_name in PMS_TOOL_NAMES else "Telemetry (port 5010)"
+        return json.dumps({"error": f"MCP {server} server not running."})
     except Exception as e:
         logger.error(f"Tool call failed: {e}")
         return json.dumps({"error": str(e)})
@@ -141,16 +307,37 @@ def parse_tool_call(response_text: str):
 
 
 def needs_tool_call(question: str, imo: str = None) -> bool:
-    """Quick heuristic: does this question likely need telemetry data?"""
+    """Heuristic: does this question need any tool (telemetry OR PMS)?"""
+    
     telemetry_keywords = [
-        "current", "latest", "right now", "status", "reading", "sensor",
-        "rpm", "power", "speed", "temperature", "pressure", "fuel",
+        "current", "latest", "right now", "reading", "sensor",
+        "rpm", "power", "speed", "temperature", "pressure",
         "alarm", "fault", "warning", "shutdown", "failure", "trip",
         "generator", "dg", "auxiliary", "ae1", "ae2", "ae3", "ae4",
-        "trend", "history", "last 24", "last hour", "over time",
+        "trend", "last 24", "last hour", "over time",
         "telemetry", "live", "real-time", "realtime",
         "position", "latitude", "longitude", "heading", "sog", "stw",
-        "wind", "weather", "turbocharger", "tc rpm",
+        "wind", "weather", "turbocharger rpm", "tc rpm",
+        "anchored", "at sea", "sailing", "underway",
     ]
+    
+    pms_keywords = [
+        "maintenance", "job plan", "pending job", "overdue", "due job",
+        "completed job", "job history", "job report", "inspection",
+        "spare part", "spares", "stock", "rob", "reorder", "inventory",
+        "running hour", "counter reading", "equipment list", "maker",
+        "serial number", "pms", "planned maintenance",
+        "schedule", "frequency", "overhaul", "calibration",
+        "service history", "testing", "condition", "last done", "next due",
+        "what needs to be done", "what is due", "what was done",
+        "boiler maintenance", "pump maintenance", "compressor", "purifier",
+        "low stock", "critical", "safety critical",
+        "maintenance summary", "maintenance dashboard", "pms status",
+    ]
+    
     q_lower = question.lower()
-    return any(kw in q_lower for kw in telemetry_keywords) and imo is not None
+    
+    needs_telemetry = any(kw in q_lower for kw in telemetry_keywords) and imo is not None
+    needs_pms = any(kw in q_lower for kw in pms_keywords)
+    
+    return needs_telemetry or needs_pms

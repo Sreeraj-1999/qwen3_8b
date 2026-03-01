@@ -43,6 +43,67 @@ vessel_manager: VesselSpecificManager = None
 db_manager = None
 queue_manager = None
 
+# ============= CONVERSATION MEMORY =============
+from collections import OrderedDict
+import time as _time
+
+class ConversationMemory:
+    """In-memory conversation history store, keyed by session_id.
+    
+    - Keeps last MAX_SESSIONS sessions (LRU eviction)
+    - Each session stores up to MAX_TURNS user/assistant pairs
+    - Auto-expires sessions after TTL_SECONDS of inactivity
+    """
+    MAX_SESSIONS = 200
+    MAX_TURNS = 3         # 3 user+assistant pairs = 6 messages
+    TTL_SECONDS = 3600    # 1 hour inactivity timeout
+
+    def __init__(self):
+        self._store: OrderedDict[str, dict] = OrderedDict()
+
+    def _evict(self):
+        """Remove expired and over-limit sessions."""
+        now = _time.time()
+        # Remove expired
+        expired = [sid for sid, s in self._store.items() if now - s['last_access'] > self.TTL_SECONDS]
+        for sid in expired:
+            del self._store[sid]
+        # Remove oldest if over limit
+        while len(self._store) > self.MAX_SESSIONS:
+            self._store.popitem(last=False)
+
+    def get_history(self, session_id: str) -> list:
+        """Return list of past messages [{role, content}, ...] for this session."""
+        self._evict()
+        if session_id in self._store:
+            self._store[session_id]['last_access'] = _time.time()
+            self._store.move_to_end(session_id)
+            return list(self._store[session_id]['messages'])
+        return []
+
+    def add_exchange(self, session_id: str, user_msg: str, assistant_msg: str):
+        """Store a user+assistant exchange."""
+        self._evict()
+        if session_id not in self._store:
+            self._store[session_id] = {'messages': [], 'last_access': _time.time()}
+        
+        session = self._store[session_id]
+        session['messages'].append({'role': 'user', 'content': user_msg})
+        session['messages'].append({'role': 'assistant', 'content': assistant_msg})
+        session['last_access'] = _time.time()
+        
+        # Trim to MAX_TURNS pairs (keep last N pairs)
+        if len(session['messages']) > self.MAX_TURNS * 2:
+            session['messages'] = session['messages'][-(self.MAX_TURNS * 2):]
+        
+        self._store.move_to_end(session_id)
+
+    def clear_session(self, session_id: str):
+        """Manually clear a session."""
+        self._store.pop(session_id, None)
+
+conversation_memory = ConversationMemory()
+
 # File upload settings
 UPLOAD_FOLDER = './temp_uploads'
 ALLOWED_EXTENSIONS = {'pdf', 'docx', 'doc', 'xlsx', 'xls', 'txt'}
@@ -448,7 +509,7 @@ Stop after 7 points."""
                 
                 response = requests.post("http://localhost:5005/gpu/llm/generate", 
                                     json={"messages": messages, "response_type": response_type}, 
-                                    timeout=60)
+                                    timeout=120)
                 return response.json().get('response', '')
             
             reasons_result = process_fixed_manual_query(
@@ -533,29 +594,42 @@ Stop after 7 points."""
 
 @app.post("/chat/response/")
 async def chat_general(request_data: Dict[str, Any]):
-    """General chat endpoint - NO RAG, NO IMO"""
+    """General chat endpoint - NO RAG, NO IMO — with conversation memory"""
     try:
         question = (request_data.get('chat') or request_data.get('question') or '').strip()
+        session_id = (request_data.get('session_id') or '').strip()
+        logger.info(f"DEBUG session_id received: '{session_id}', history: {conversation_memory.get_history(session_id)}")
+        logger.info(f"DEBUG for C/R session_id received: '{session_id}', history: {conversation_memory.get_history(session_id)}")
         
         if not question:
             return JSONResponse(content={'error': 'No question provided.'}, status_code=400)
         
-        logger.info(f"General chat request, Q: {question}")
+        logger.info(f"General chat request, session: {session_id or 'none'}, Q: {question}")
         
-        # messages = [
-        #     {'role': 'user', 'content': f"You are a friendly and knowledgeable marine engineering assistant. Be helpful, conversational, and concise. Plain text only, no HTML. Never include special tokens or end-of-sentence markers in your response.\n\n{question}"}
-        # ]
-        messages = [
-        {'role': 'system', 'content': 'You are a friendly and knowledgeable marine engineering assistant. Be helpful, conversational, and concise. Plain text only, no HTML.'},
-        {'role': 'user', 'content': question}
-        ]
+        # Build messages with history
+        system_msg = {'role': 'system', 'content': 'You are a friendly and knowledgeable marine engineering assistant. Be helpful, conversational, and concise. Plain text only, no HTML.'}
+        
+        messages = [system_msg]
+        
+        # Inject conversation history if session_id provided
+        if session_id:
+            history = conversation_memory.get_history(session_id)
+            if history:
+                messages.extend(history)
+                logger.info(f"Injected {len(history)} history messages for session {session_id}")
+        
+        messages.append({'role': 'user', 'content': question})
         
         response = requests.post(
             "http://localhost:5005/gpu/llm/generate",
             json={"messages": messages, "response_type": "general_chat","imo": request_data.get('imo')},
-            timeout=60
+            timeout=200
         )
         answer = response.json().get('response', '')
+        
+        # Store exchange in memory
+        if session_id and answer:
+            conversation_memory.add_exchange(session_id, question, answer)
         
         data_object = {'answer': answer}
         
@@ -580,14 +654,15 @@ async def chat_general(request_data: Dict[str, Any]):
 
 @app.post("/chat/stream/")
 async def chat_stream(request_data: Dict[str, Any]):
-    """Streaming chat endpoint - SSE"""
+    """Streaming chat endpoint - SSE — with conversation memory"""
     question = (request_data.get('chat') or request_data.get('question') or '').strip()
     vessel_imo = (request_data.get('imo') or '').strip()
+    session_id = (request_data.get('session_id') or '').strip()
     
     if not question:
         return JSONResponse(content={'error': 'No question provided.'}, status_code=400)
     
-    logger.info(f"Stream request - IMO: {vessel_imo if vessel_imo else 'GENERAL'}, Q: {question}")
+    logger.info(f"Stream request - IMO: {vessel_imo if vessel_imo else 'GENERAL'}, session: {session_id or 'none'}, Q: {question}")
     
     async def event_generator():
         full_answer = ""
@@ -637,11 +712,19 @@ async def chat_stream(request_data: Dict[str, Any]):
 
 {question}"""
             
-            # No system role — DeepSeek official recommendation
+            # Build messages WITH history
             messages = [
             {'role': 'system', 'content': 'You are a marine and offshore engineering expert. Provide accurate, concise, and technically sound answers.'},
-            {'role': 'user', 'content': user_content}
-                       ]
+            ]
+            
+            # Inject conversation history if session_id provided
+            if session_id:
+                history = conversation_memory.get_history(session_id)
+                if history:
+                    messages.extend(history)
+                    logger.info(f"Injected {len(history)} history messages for stream session {session_id}")
+            
+            messages.append({'role': 'user', 'content': user_content})
             
             # Stream from gpu_service
             async with httpx.AsyncClient(timeout=300.0) as client:
@@ -659,12 +742,6 @@ async def chat_stream(request_data: Dict[str, Any]):
                                 if data.get('type') == 'answer':
                                     chunk = data.get('content', '')
                                     
-                                    # Clean all unwanted tokens from chunk (NO STRIP!)
-                                    # chunk = chunk.replace('<｜end▁of▁sentence｜>', '')
-                                    # chunk = chunk.replace('<|end▁of▁sentence|>', '')
-                                    # chunk = chunk.replace('<|im_end|>', '')
-                                    # chunk = chunk.replace('<｜im_end｜>', '')
-                                    # chunk = chunk.replace('<br>', '').replace('</br>', '').replace('<br/>', '')
                                     chunk = chunk.replace('<|im_end|>', '')
                                     chunk = chunk.replace('<|im_start|>', '')
                                     
@@ -688,14 +765,13 @@ async def chat_stream(request_data: Dict[str, Any]):
                     logger.info(f"STREAM COMPLETE - Full answer length: {len(full_answer)}")
                     logger.info(f"FULL ANSWER PREVIEW: {full_answer[:150]}...")
                     
+                    # Store exchange in memory AFTER stream completes
+                    if session_id and full_answer.strip():
+                        conversation_memory.add_exchange(session_id, question, full_answer.strip())
+                        logger.info(f"Stored exchange in memory for session {session_id}")
+                    
                     # Generate audio from cleaned answer
                     if full_answer.strip():
-                        # Final cleaning pass
-                        # full_answer = full_answer.replace('<｜end▁of▁sentence｜>', '')
-                        # full_answer = full_answer.replace('<|end▁of▁sentence|>', '')
-                        # full_answer = full_answer.replace('<|im_end|>', '')
-                        # full_answer = full_answer.replace('<｜im_end｜>', '')
-                        # full_answer = full_answer.replace('<br>', '').replace('</br>', '').replace('<br/>', '')
                         full_answer = full_answer.replace('<|im_end|>', '')
                         full_answer = full_answer.replace('<|im_start|>', '')
                         full_answer = full_answer.strip()  # Strip ONLY the final complete answer
@@ -748,6 +824,21 @@ async def chat_stream(request_data: Dict[str, Any]):
     
     # return StreamingResponse(event_generator(), media_type="text/event-stream")
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
+
+# ============= CONVERSATION MEMORY ENDPOINTS =============
+
+@app.delete("/chat/memory/{session_id}")
+async def clear_chat_memory(session_id: str):
+    """Clear conversation memory for a session (call on 'New Chat')"""
+    conversation_memory.clear_session(session_id)
+    logger.info(f"Cleared memory for session {session_id}")
+    return {"status": "cleared", "session_id": session_id}
+
+@app.get("/chat/memory/{session_id}")
+async def get_chat_memory(session_id: str):
+    """View conversation memory for a session (debug)"""
+    history = conversation_memory.get_history(session_id)
+    return {"session_id": session_id, "messages": history, "turn_count": len(history) // 2}
 
 @app.post("/audio/transcribe/")
 async def simple_transcription(audio: UploadFile = File(...)):
@@ -811,7 +902,7 @@ async def chat_general(request_data: Dict[str, Any]):
                 generate_llm_response_func=lambda msgs, rt: requests.post(
                     "http://localhost:5005/gpu/llm/generate",
                     json={"messages": msgs, "response_type": rt},
-                    timeout=60
+                    timeout=200
                 ).json().get('response', '')
             )
             result['vessel_imo'] = imo
@@ -820,7 +911,7 @@ async def chat_general(request_data: Dict[str, Any]):
             response = requests.post(
                 "http://localhost:5005/gpu/llm/generate",
                 json={"messages": messages, "response_type": "general_chat"},
-                timeout=60
+                timeout=200
             )
             result = {
                 'question': question,
@@ -887,7 +978,7 @@ async def query_vessel_manuals(imo: str, request_data: Dict[str, Any]):
                 response = requests.post(
                     "http://localhost:5005/gpu/llm/generate",
                     json={"messages": messages, "response_type": response_type},
-                    timeout=60
+                    timeout=200
                 )
                 response.raise_for_status()
                 print(f"DEBUG - GPU service response: {result}")
@@ -946,7 +1037,7 @@ async def chat_with_vessel(imo: str, request_data: Dict[str, Any]):
                 response = requests.post(
                     "http://localhost:5005/gpu/llm/generate",
                     json={"messages": messages, "response_type": response_type},
-                    timeout=60
+                    timeout=200
                 )
                 response.raise_for_status()
                 result = response.json()
@@ -1080,7 +1171,7 @@ async def compare_faces(
 async def fuel_analysis(request_data: Dict[str, Any]):
     """Analyze fuel consumption - handles both ME and AE"""
     try:
-        print(request_data)
+        # print(request_data)
         data = request_data
         
         # Handle different payload structures
@@ -1229,7 +1320,7 @@ async def fuel_analysis(request_data: Dict[str, Any]):
             'alert_me': alert_me
         }
         
-        print("RESPP", result)
+        # print("RESPP", result)
         return result
         
     except Exception as e:
