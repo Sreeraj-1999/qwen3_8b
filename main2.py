@@ -657,6 +657,8 @@ async def chat_stream(request_data: Dict[str, Any]):
     question = (request_data.get('chat') or request_data.get('question') or '').strip()
     vessel_imo = (request_data.get('imo') or '').strip()
     session_id = (request_data.get('session_id') or '').strip()
+    enable_thinking = request_data.get('enable_thinking', False)
+    logger.info(f"DEBUG ROUTING - vessel_imo: '{vessel_imo}', enable_thinking: {enable_thinking}, type: {type(enable_thinking)}")
     
     if not question:
         return JSONResponse(content={'error': 'No question provided.'}, status_code=400)
@@ -664,13 +666,14 @@ async def chat_stream(request_data: Dict[str, Any]):
     logger.info(f"Stream request - IMO: {vessel_imo if vessel_imo else 'GENERAL'}, session: {session_id or 'none'}, Q: {question}")
     
     async def event_generator():
+
         full_answer = ""
         try:
             # If vessel-specific, get RAG context first
             context = ""
             metadata = []
             
-            if vessel_imo:
+            if vessel_imo and enable_thinking:
                 vessel = vessel_manager.get_vessel_instance(vessel_imo)
                 # Rewrite follow-up queries for better embedding search
                 search_query = question
@@ -686,53 +689,47 @@ async def chat_stream(request_data: Dict[str, Any]):
                                 timeout=200
                             ).json().get('response', '')
                         search_query = rewrite_followup_query(question, history, _llm_call)
-                # query_result = vessel.get_manual_processor().query_manuals(question, n_results=15)
+                
                 query_result = vessel.get_manual_processor().query_manuals(search_query, n_results=15)
                 logger.info(f"DEBUG STREAM RAG - search_query going to embedding: '{search_query}'")
                 if query_result.get('context'):
-                    print("ABOUT TO MERGE")
                     from test3 import _merge_overlapping_chunks
                     context = _merge_overlapping_chunks(
                         query_result['context'],
                         query_result.get('metadata_detailed', [])
                     )
-                    print(f"MERGE DONE - context length: {len(context)}")
-                    with open('merged_debug.txt', 'w',encoding='utf-8') as f:
-                        f.write(context)
                     metadata = query_result.get('metadata', [])
-                    print(f"BEFORE MERGE chunks: {query_result['context'].count('[TEXT from')}")
-                    print(f"AFTER MERGE chunks: {context.count('[TEXT from')}")
+            logger.info(f"DEBUG CONTEXT - context_found: {bool(context)}, context_length: {len(context)}")
             
             # Build user content
             if context:
                 user_content = f"""You are answering based on manual excerpts.
 
-            RULES YOU MUST FOLLOW:
-            1. If the context contains a NUMBERED PROCEDURE (Step 1, Step 2... or 1., 2., 3...), you MUST list EVERY step. Do NOT summarize steps. Do NOT skip any step.
-            2. Multiple context sections may contain OVERLAPPING parts of the same procedure. Combine them into ONE complete list with ALL unique steps.
-            3. Copy ALL numbers, codes, values EXACTLY as written. Never approximate.
-            4. If information is not in the context, say so.
-            5.DO NOT SUMMARIZE.LIST EVERY STEP IF IT IS A PROCEDURE.
+    RULES YOU MUST FOLLOW:
+    1. If the context contains a NUMBERED PROCEDURE (Step 1, Step 2... or 1., 2., 3...), you MUST list EVERY step. Do NOT summarize steps. Do NOT skip any step.
+    2. Multiple context sections may contain OVERLAPPING parts of the same procedure. Combine them into ONE complete list with ALL unique steps.
+    3. Copy ALL numbers, codes, values EXACTLY as written. Never approximate.
+    4. If information is not in the context, say so.
+    5. DO NOT SUMMARIZE. LIST EVERY STEP IF IT IS A PROCEDURE.
 
-            CONTEXT:
-            {context}
+    CONTEXT:
+    {context}
 
-            QUESTION: {question}
+    QUESTION: {question}
 
-            YOUR ANSWER (list every step if it's a procedure):"""
-
-
+    YOUR ANSWER (list every step if it's a procedure):"""
             else:
-                user_content = f"""You are a friendly and knowledgeable marine engineering assistant. Answer in English only. Plain text only, no HTML tags or markdown. Never include special tokens or end-of-sentence markers in your response. Be concise and helpful.
+                user_content = question
+    #             user_content = f"""You are a friendly and knowledgeable marine engineering assistant. Answer in English only. Plain text only, no HTML tags or markdown. Never include special tokens or end-of-sentence markers in your response. Be concise and helpful.
 
-{question}"""
+    # {question}"""
             
             # Build messages WITH history
             messages = [
-            {'role': 'system', 'content': 'You are a marine and offshore engineering expert. Provide accurate, concise, and technically sound answers.'},
+                {'role': 'system', 'content': 'You are a marine and offshore engineering expert. Provide accurate, concise, and technically sound answers.'},
             ]
             
-            # Inject conversation history if session_id provided
+            # Inject conversation history
             if session_id:
                 history = conversation_memory.get_history(session_id)
                 if history:
@@ -741,44 +738,77 @@ async def chat_stream(request_data: Dict[str, Any]):
             
             messages.append({'role': 'user', 'content': user_content})
             
-            # Stream from gpu_service
+            # ============================================================
+            # DECISION: Which GPU endpoint to use?
+            #
+            # ALWAYS use /gpu/llm/stream-chat now:
+            #   - With IMO: tools enabled, handles tool calls + streams answer
+            #   - Without IMO: no tools, just streams answer directly
+            #   - RAG context is already baked into user_content above
+            #
+            # For RAG + thinking mode, we still want thinking visible,
+            # so we use /gpu/llm/stream for that case.
+            # ============================================================
+            
+            use_thinking = bool(context)  # RAG = thinking mode, general/tools = no thinking
+            
+            if use_thinking:
+                # RAG case: use /gpu/llm/stream for thinking + answer streaming
+                gpu_url = 'http://localhost:5005/gpu/llm/stream'
+                gpu_payload = {'messages': messages, 'imo': vessel_imo}
+            else:
+                # General chat OR tool-capable: use /gpu/llm/stream-chat
+                gpu_url = 'http://localhost:5005/gpu/llm/stream-chat'
+                gpu_payload = {
+                    'messages': messages,
+                    'imo': vessel_imo if vessel_imo else None,
+                    'response_type': 'general_chat' if not vessel_imo else 'vessel_chat'
+                }
+            
+            logger.info(f"STREAM routing to: {gpu_url} (thinking={use_thinking}, imo={vessel_imo})")
+            logger.info(f"DEBUG FINAL ROUTE - gpu_url: {gpu_url}, payload_keys: {list(gpu_payload.keys())}")
+            
+            # Stream from GPU service
             async with httpx.AsyncClient(timeout=300.0) as client:
-                async with client.stream(
-                    'POST',
-                    'http://localhost:5005/gpu/llm/stream',
-                    json={'messages': messages,'imo':vessel_imo}
-                ) as response:
+                async with client.stream('POST', gpu_url, json=gpu_payload) as response:
                     async for line in response.aiter_lines():
                         if line.startswith('data:'):
                             try:
                                 data = json.loads(line[5:].strip())
+                                event_type = data.get('type', '')
                                 
-                                # Clean answer chunks before sending to frontend
-                                if data.get('type') == 'answer':
+                                if event_type == 'answer':
                                     chunk = data.get('content', '')
-                                    
                                     chunk = chunk.replace('<|im_end|>', '')
                                     chunk = chunk.replace('<|im_start|>', '')
-                                    
-                                    # Only send non-empty chunks (keep spaces!)
                                     if chunk:
-                                        # Update data with cleaned chunk
                                         data['content'] = chunk
-                                        
-                                        # Collect for TTS
                                         full_answer += chunk
-                                        
-                                        # Send cleaned chunk to frontend
                                         yield f"data: {json.dumps(data)}\n\n"
+                                
+                                elif event_type == 'thinking':
+                                    # Forward thinking chunks (RAG mode)
+                                    yield f"data: {json.dumps(data)}\n\n"
+                                
+                                elif event_type == 'tool_status':
+                                    # Forward tool status ("Fetching latest vessel readings...")
+                                    yield f"data: {json.dumps(data)}\n\n"
+                                
+                                elif event_type == 'done':
+                                    # Don't yield done yet — we still need to send audio + metadata
+                                    pass
+                                
+                                elif event_type == 'error':
+                                    yield f"data: {json.dumps(data)}\n\n"
+                                
                                 else:
-                                    # For 'thinking', 'done', 'error' - send as-is
                                     yield f"{line}\n\n"
+                            
                             except Exception as parse_error:
                                 logger.warning(f"Failed to parse line: {parse_error}")
                                 yield f"{line}\n\n"
                     
                     logger.info(f"STREAM COMPLETE - Full answer length: {len(full_answer)}")
-                    logger.info(f"FULL ANSWER PREVIEW: {full_answer[:150]}...")
                     
                     # Store exchange in memory AFTER stream completes
                     if session_id and full_answer.strip():
@@ -787,11 +817,7 @@ async def chat_stream(request_data: Dict[str, Any]):
                     
                     # Generate audio from cleaned answer
                     if full_answer.strip():
-                        full_answer = full_answer.replace('<|im_end|>', '')
-                        full_answer = full_answer.replace('<|im_start|>', '')
-                        full_answer = full_answer.strip()  # Strip ONLY the final complete answer
-                        
-                        logger.info(f"GENERATING AUDIO FOR TEXT (length={len(full_answer)})")
+                        full_answer = full_answer.replace('<|im_end|>', '').replace('<|im_start|>', '').strip()
                         
                         try:
                             audio_result = await queue_manager.process_immediately(
@@ -801,43 +827,26 @@ async def chat_stream(request_data: Dict[str, Any]):
                                 vessel_imo=vessel_imo if vessel_imo else None
                             )
                             
-                            logger.info(f"AUDIO RESULT RECEIVED: {list(audio_result.keys()) if audio_result else 'None'}")
-                            
                             if audio_result and audio_result.get('audio_blob'):
                                 audio_blob = audio_result['audio_blob']
-                                blob_length = len(audio_blob)
-                                
-                                logger.info(f"AUDIO BLOB EXTRACTED - Length: {blob_length}")
-                                
-                                # Send blob IMMEDIATELY
-                                blob_data = json.dumps({'type': 'blob', 'content': audio_blob})
-                                logger.info(f"BLOB JSON SIZE: {len(blob_data)} bytes")
-                                
-                                yield f"data: {blob_data}\n\n"
-                                logger.info("✓ BLOB SENT TO FRONTEND")
-                            else:
-                                logger.warning(f"NO AUDIO BLOB - Result: {audio_result}")
+                                yield f"data: {json.dumps({'type': 'blob', 'content': audio_blob})}\n\n"
+                                logger.info("Audio blob sent to frontend")
                         except Exception as audio_error:
-                            logger.error(f"AUDIO GENERATION FAILED: {audio_error}")
-                            logger.error(traceback.format_exc())
-                    else:
-                        logger.warning("FULL ANSWER IS EMPTY - NO AUDIO GENERATED")
+                            logger.error(f"Audio generation failed: {audio_error}")
                     
                     # Send metadata if available
                     if metadata:
-                        logger.info(f"SENDING METADATA - {len(metadata)} items")
                         yield f"data: {json.dumps({'type': 'metadata', 'content': metadata})}\n\n"
                     
                     # Send done signal
-                    logger.info("SENDING DONE SIGNAL")
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 
         except Exception as e:
             logger.error(f"STREAM ERROR: {e}")
             logger.error(traceback.format_exc())
             yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
-    
-    # return StreamingResponse(event_generator(), media_type="text/event-stream")
+        
+        # return StreamingResponse(event_generator(), media_type="text/event-stream")
     return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"})
 
 # ============= CONVERSATION MEMORY ENDPOINTS =============

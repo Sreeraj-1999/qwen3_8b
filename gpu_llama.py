@@ -468,10 +468,183 @@ def stream_llm_response():
                 logger.error(traceback.format_exc())
                 yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
         
-        return Response(generate(), mimetype='text/event-stream')
+        return Response(generate(), mimetype='text/event-stream',
+                        headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache'})
         
     except Exception as e:
         logger.error(f"Error in LLM stream: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# Friendly tool-name to status message mapping
+TOOL_STATUS_MESSAGES = {
+    'get_latest_readings': 'Fetching latest vessel readings...',
+    'get_active_alarms': 'Checking for active alarms...',
+    'get_sensor_history': 'Fetching sensor history...',
+    'get_generator_status': 'Checking generator status...',
+    'query_telemetry': 'Querying vessel telemetry...',
+    'search_equipment': 'Searching equipment registry...',
+    'get_maintenance_schedule': 'Fetching maintenance schedule...',
+    'get_pending_jobs': 'Checking pending maintenance jobs...',
+    'get_job_history': 'Retrieving maintenance history...',
+    'get_running_hours': 'Fetching running hour data...',
+    'search_spare_parts': 'Searching spare parts inventory...',
+    'get_maintenance_summary': 'Loading maintenance summary...',
+    'get_equipment_full_status': 'Fetching complete equipment status...',
+}
+
+@app.route('/gpu/llm/stream-chat', methods=['POST'])
+def stream_chat_response():
+    """Stream chat response with tool calling support — no thinking"""
+    try:
+        data = request.get_json()
+        messages = data.get('messages', [])
+        response_type = data.get('response_type', 'general')
+        enable_thinking = False
+        imo = data.get('imo')
+        if imo and messages and messages[0].get('role') == 'system':
+            messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
+            Current year is 2026. When querying time ranges, use 2026.
+            Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
+
+        if not messages:
+            return jsonify({'error': 'No messages provided'}), 400
+
+        # Tools always available based on context
+        tools = ALL_TOOLS if imo else PMS_TOOLS
+
+        # --- Same history handling as /generate ---
+        system_msg = None
+        history_msgs = []
+        current_user_msg = None
+
+        for m in messages:
+            if m['role'] == 'system' and system_msg is None:
+                system_msg = m
+            elif m['role'] == 'user' and m == messages[-1]:
+                current_user_msg = m
+            else:
+                history_msgs.append(m)
+
+        if history_msgs and system_msg:
+            history_text = "\n\n=== CONVERSATION HISTORY (use this for follow-up questions) ===\n"
+            for h in history_msgs:
+                role_label = "User" if h['role'] == 'user' else "Assistant"
+                content = h['content'][:300] + "..." if len(h['content']) > 300 else h['content']
+                history_text += f"{role_label}: {content}\n"
+            history_text += "=== END HISTORY ===\n"
+            system_msg['content'] += history_text
+            messages = [system_msg, current_user_msg]
+
+        logger.info(f"=== STREAM-CHAT PROMPT: {len(messages)} msgs, tools={'yes' if tools else 'no'}, history={len(history_msgs)} msgs ===")
+
+        def generate():
+            try:
+                # Decide: does this question likely need tool calling?
+                user_question = ""
+                for m in reversed(messages):
+                    if m['role'] == 'user':
+                        user_question = m['content']
+                        break
+                
+                # likely_tool = bool(tools) and needs_tool_call(user_question)
+                # likely_tool = bool(tools) and needs_tool_call(user_question, imo)
+                likely_tool = bool(tools)
+                logger.info(f"DEBUG TOOL - user_question: '{user_question[:100]}', tools: {bool(tools)}, likely_tool: {likely_tool}")
+                
+                if likely_tool:
+                    logger.info(f"DEBUG PATH A - generating with tool detection")
+                    # === PATH A: Tool detection required — non-streaming pass 1 ===
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=enable_thinking,
+                        tools=tools
+                    )
+                    response = gguf_generate(text, max_tokens=1024, temperature=0.1)
+
+                    if "<tool_call>" in response:
+                        tool_name, tool_args = parse_tool_call(response)
+                        if tool_name:
+                            # Send friendly status message
+                            status_msg = TOOL_STATUS_MESSAGES.get(tool_name, 'Processing your request...')
+                            yield f"data: {json.dumps({'type': 'tool_status', 'content': status_msg})}\n\n"
+
+                            # Execute the tool
+                            tool_result = execute_tool_call(tool_name, tool_args)
+
+                            with open('tool_debug.txt', 'w', encoding='utf-8') as f:
+                                f.write("=== MODEL FIRST RESPONSE ===\n")
+                                f.write(response + "\n\n")
+                                f.write("=== TOOL CALLED ===\n")
+                                f.write(f"Name: {tool_name}\n")
+                                f.write(f"Args: {json.dumps(tool_args, indent=2)}\n\n")
+                                f.write("=== TOOL RESULT ===\n")
+                                f.write(tool_result + "\n\n")
+                            logger.info(f"Tool debug written to tool_debug.txt")
+
+                            # Build Pass 2 messages
+                            pass2_messages = list(messages)
+                            pass2_messages.append({"role": "assistant", "content": response.replace("<|im_end|>", "").strip()})
+                            pass2_messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data. List ALL items completely."})
+
+                            # === PASS 2: Stream the final answer ===
+                            text2 = tokenizer.apply_chat_template(
+                                pass2_messages, tokenize=False,
+                                add_generation_prompt=True, enable_thinking=False
+                            )
+                            text2 = truncate_prompt_to_fit(text2, max_gen_tokens=1024)
+
+                            for token in gguf_stream(text2, max_tokens=1024, temperature=0.1):
+                                clean = token.replace("<|im_end|>", "").replace("<|im_start|>", "")
+                                clean = clean.replace("<think>", "").replace("</think>", "")
+                                if clean:
+                                    yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+
+                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                            return
+                    
+                    # Tool was expected but model didn't call one — send response as stream
+                    if "</think>" in response:
+                        response = response.split("</think>")[-1]
+                    response = response.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+                    
+                    # Send in reasonable chunks
+                    chunk_size = 4
+                    for i in range(0, len(response), chunk_size):
+                        chunk = response[i:i + chunk_size]
+                        if chunk:
+                            yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
+                    
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                
+                else:
+                    logger.info(f"DEBUG PATH B - direct streaming, no tools")
+                    # === PATH B: No tools needed — REAL streaming directly ===
+                    text = tokenizer.apply_chat_template(
+                        messages, tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=False  # No thinking for general chat
+                    )
+
+                    for token in gguf_stream(text, max_tokens=1024, temperature=0.1):
+                        clean = token.replace("<|im_end|>", "").replace("<|im_start|>", "")
+                        clean = clean.replace("<think>", "").replace("</think>", "")
+                        if clean:
+                            yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+
+                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+            except Exception as e:
+                logger.error(f"Stream-chat error: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+        return Response(generate(), mimetype='text/event-stream',
+                        headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache'})
+
+    except Exception as e:
+        logger.error(f"Error in stream-chat: {e}")
         return jsonify({'error': str(e)}), 500
 
 @app.route('/gpu/stt/transcribe', methods=['POST'])
