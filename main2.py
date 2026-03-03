@@ -18,7 +18,6 @@ import requests
 from vessel_manager import VesselSpecificManager
 from database import initialize_database, get_database_manager
 from queue_manager import initialize_queue_manager, get_queue_manager, Priority, process_chat_immediately
-# from test import process_fixed_manual_query
 from test3 import process_fixed_manual_query
 # from faultsense import load_config_with_overrides, process_smart_maintenance_results, run_pipeline
 import pickle
@@ -673,7 +672,23 @@ async def chat_stream(request_data: Dict[str, Any]):
             
             if vessel_imo:
                 vessel = vessel_manager.get_vessel_instance(vessel_imo)
-                query_result = vessel.get_manual_processor().query_manuals(question, n_results=15)
+                # Rewrite follow-up queries for better embedding search
+                search_query = question
+                logger.info(f"DEBUG STREAM RAG - vessel_imo: {vessel_imo}, session_id: {session_id}, original question: {question}")
+                if session_id:
+                    history = conversation_memory.get_history(session_id)
+                    if history:
+                        from test3 import rewrite_followup_query
+                        def _llm_call(msgs, rt):
+                            return requests.post(
+                                "http://localhost:5005/gpu/llm/generate",
+                                json={"messages": msgs, "response_type": rt},
+                                timeout=200
+                            ).json().get('response', '')
+                        search_query = rewrite_followup_query(question, history, _llm_call)
+                # query_result = vessel.get_manual_processor().query_manuals(question, n_results=15)
+                query_result = vessel.get_manual_processor().query_manuals(search_query, n_results=15)
+                logger.info(f"DEBUG STREAM RAG - search_query going to embedding: '{search_query}'")
                 if query_result.get('context'):
                     print("ABOUT TO MERGE")
                     from test3 import _merge_overlapping_chunks
@@ -903,7 +918,8 @@ async def chat_general(request_data: Dict[str, Any]):
                     "http://localhost:5005/gpu/llm/generate",
                     json={"messages": msgs, "response_type": rt},
                     timeout=200
-                ).json().get('response', '')
+                ).json().get('response', ''),
+                conversation_history=conversation_memory.get_history(session_id) if session_id else None
             )
             result['vessel_imo'] = imo
         else:

@@ -282,7 +282,8 @@ def execute_tool_call(tool_name: str, arguments: dict) -> str:
                 result[key] = result[key][:20]
                 result[f"_{key}_note"] = f"Showing 20 of {total} records"
         
-        return json.dumps(result, indent=2)
+        # return json.dumps(result, indent=2)
+        return json.dumps(result, separators=(',', ':'))
     
     except requests.exceptions.ConnectionError:
         server = "PMS (port 5011)" if tool_name in PMS_TOOL_NAMES else "Telemetry (port 5010)"

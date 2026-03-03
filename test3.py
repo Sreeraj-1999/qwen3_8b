@@ -33,6 +33,44 @@ from embedding_service import embedding_service
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def rewrite_followup_query(question: str, conversation_history: list, generate_llm_response_func) -> str:
+    """
+    If there's conversation history, ask the LLM to resolve the query into a standalone search query.
+    If no history, return as-is.
+    """
+    if not conversation_history:
+        return question
+    
+    recent_history = conversation_history[-4:]  # last 2 exchanges
+    history_text = ""
+    for msg in recent_history:
+        role = "User" if msg['role'] == 'user' else "Assistant"
+        content = msg['content'][:200] + "..." if len(msg['content']) > 200 else msg['content']
+        history_text += f"{role}: {content}\n"
+    
+    rewrite_messages = [
+        {
+            'role': 'system',
+            'content': 'You are a query rewriter. Given conversation history and a follow-up message, rewrite the message as a standalone search query. The rewritten query must NOT contain vague words like "elaborate", "explain more", "it", "this", "that". It MUST contain the specific technical topic from the conversation. Output ONLY the rewritten query, nothing else.'
+        },
+        {
+            'role': 'user',
+            'content': f"History:\n{history_text}\nFollow-up: {question}\n\nStandalone query:"
+        }
+    ]
+    
+    try:
+        rewritten = generate_llm_response_func(rewrite_messages, "query_rewrite")
+        rewritten = rewritten.strip().strip('"').strip("'")
+        
+        if rewritten and 3 < len(rewritten) < 300:
+            logger.info(f"Query rewrite: '{question}' → '{rewritten}'")
+            return rewritten
+        return question
+    except Exception as e:
+        logger.warning(f"Query rewrite failed: {e}")
+        return question
+
 
 # =============================================================================
 # EMBEDDING WRAPPER (unchanged)
@@ -1312,10 +1350,13 @@ def _merge_overlapping_chunks(context_text: str, metadata_detailed: list) -> str
     
     return '\n\n'.join(parts)
 
-def process_fixed_manual_query(processor, question, llm_messages, generate_llm_response_func):
+def process_fixed_manual_query(processor, question, llm_messages, generate_llm_response_func, conversation_history=None):
     print("REACHED TEST3 PROCESS_FIXED_MANUAL_QUERY")
+    # Rewrite follow-up questions into standalone search queries
+    search_query = rewrite_followup_query(question, conversation_history or [], generate_llm_response_func)
     processor.gpu_manager.cleanup()
-    query_result = processor.query_manuals(question, n_results=10, save_context=True)
+    # query_result = processor.query_manuals(question, n_results=10, save_context=True)
+    query_result = processor.query_manuals(search_query, n_results=10, save_context=True)
     
     if query_result.get('error'):
         return query_result

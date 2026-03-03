@@ -19,14 +19,13 @@ GGUF_MODEL_PATH = r"C:\Users\User\Desktop\siemens\PROJECT5D\test\qwen3_marine_Q4
 
 llm = Llama(
     model_path=GGUF_MODEL_PATH,
-    n_ctx=4096,
+    n_ctx=16384,
     n_gpu_layers=99,
     main_gpu=0,
-    cache_type_k="q8_0",
-    cache_type_v="q8_0",
+    cache_type_k="q4_0",
+    cache_type_v="q4_0",
     verbose=False,
 )
-
 logger.info("GGUF model loaded successfully")
 
 # Clear comtypes cache BEFORE importing comtypes
@@ -226,6 +225,27 @@ def gguf_stream(prompt, max_tokens=1024, temperature=0.1, stop=None):
         if token:
             yield token
 
+def truncate_prompt_to_fit(prompt, max_gen_tokens=1024):
+    """Trim ONLY conversation history if prompt too long. NEVER touches tool results."""
+    n_ctx = llm.n_ctx()
+    prompt_tokens = len(llm.tokenize(prompt.encode("utf-8")))
+    max_prompt_tokens = n_ctx - max_gen_tokens
+    
+    if prompt_tokens <= max_prompt_tokens:
+        return prompt
+    
+    logger.warning(f"Prompt {prompt_tokens} tokens, limit {max_prompt_tokens}. Trimming history.")
+    
+    history_start = prompt.find("=== CONVERSATION HISTORY")
+    history_end = prompt.find("=== END HISTORY ===")
+    
+    if history_start != -1 and history_end != -1:
+        trimmed = prompt[:history_start] + prompt[history_end + len("=== END HISTORY ==="):]
+        logger.info(f"Removed history. Now {len(llm.tokenize(trimmed.encode('utf-8')))} tokens.")
+        return trimmed
+    
+    return prompt
+
 
 @app.route('/gpu/llm/generate', methods=['POST'])
 def generate_llm_response():
@@ -284,12 +304,11 @@ def generate_llm_response():
 
         # Generate with GGUF
         response = gguf_generate(text, max_tokens=1024, temperature=0.1)
-
-        # Tool call loop (max 1 round)
         if "<tool_call>" in response:
             tool_name, tool_args = parse_tool_call(response)
             if tool_name:
                 tool_result = execute_tool_call(tool_name, tool_args)
+                
                 with open('tool_debug.txt', 'w', encoding='utf-8') as f:
                     f.write("=== MODEL FIRST RESPONSE ===\n")
                     f.write(response + "\n\n")
@@ -301,14 +320,40 @@ def generate_llm_response():
                 logger.info(f"Tool debug written to tool_debug.txt")
 
                 messages.append({"role": "assistant", "content": response.replace("<|im_end|>", "").strip()})
-                messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data."})
+                messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data. List ALL items completely."})
 
                 text2 = tokenizer.apply_chat_template(
                     messages, tokenize=False,
                     add_generation_prompt=True, enable_thinking=False
                 )
-
+                
+                text2 = truncate_prompt_to_fit(text2, max_gen_tokens=1024)
                 response = gguf_generate(text2, max_tokens=1024, temperature=0.1)
+
+        # Tool call loop (max 1 round)
+        # if "<tool_call>" in response:
+        #     tool_name, tool_args = parse_tool_call(response)
+        #     if tool_name:
+        #         tool_result = execute_tool_call(tool_name, tool_args)
+        #         with open('tool_debug.txt', 'w', encoding='utf-8') as f:
+        #             f.write("=== MODEL FIRST RESPONSE ===\n")
+        #             f.write(response + "\n\n")
+        #             f.write("=== TOOL CALLED ===\n")
+        #             f.write(f"Name: {tool_name}\n")
+        #             f.write(f"Args: {json.dumps(tool_args, indent=2)}\n\n")
+        #             f.write("=== TOOL RESULT ===\n")
+        #             f.write(tool_result + "\n\n")
+        #         logger.info(f"Tool debug written to tool_debug.txt")
+
+        #         messages.append({"role": "assistant", "content": response.replace("<|im_end|>", "").strip()})
+        #         messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data."})
+
+        #         text2 = tokenizer.apply_chat_template(
+        #             messages, tokenize=False,
+        #             add_generation_prompt=True, enable_thinking=False
+        #         )
+
+        #         response = gguf_generate(text2, max_tokens=1024, temperature=0.1)
 
         # Clean
         if "</think>" in response:
