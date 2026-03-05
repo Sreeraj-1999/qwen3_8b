@@ -896,6 +896,52 @@ async def simple_transcription(audio: UploadFile = File(...)):
             status_code=500
         )
 
+@app.post("/convert/latex")
+async def convert_to_latex(request_data: Dict[str, Any]):
+    """Convert condition expressions to LaTeX format"""
+    try:
+        condition = (request_data.get('condition') or '').strip()
+        
+        if not condition:
+            return JSONResponse(content={'error': 'No condition provided.'}, status_code=400)
+        
+        logger.info(f"LaTeX conversion request: {condition}")
+        
+        system_prompt = r"""You are a LaTeX converter. Convert the given condition into LaTeX math notation.
+
+Rules:
+1. Output ONLY the LaTeX expression. No explanation, no preamble, no markdown, no backticks.
+2. Wrap variable/sensor names in \text{}, e.g. \text{ME_RPM}
+3. Use standard LaTeX comparison operators: >, <, \geq, \leq, =, \neq
+4. Use \land for AND, \lor for OR
+5. Keep numbers as plain numbers
+6. If multiple conditions, combine them with \land or \lor as appropriate
+7. Do NOT wrap in $ signs or \[ \] delimiters
+8. Replace @ symbols in sensor names with underscores"""
+
+        messages = [
+            {'role': 'system', 'content': system_prompt},
+            {'role': 'user', 'content': condition}
+        ]
+        
+        response = requests.post(
+            "http://localhost:5005/gpu/llm/generate",
+            json={"messages": messages, "response_type": "latex_conversion"},
+            timeout=60
+        )
+        
+        latex = response.json().get('response', '').strip()
+        
+        # Clean any accidental wrapping
+        latex = latex.replace('```latex', '').replace('```', '').strip()
+        latex = latex.strip('$').strip()
+        
+        return JSONResponse(content={'latex': latex})
+        
+    except Exception as e:
+        logger.error(f"Error in LaTeX conversion: {e}")
+        return JSONResponse(content={'error': str(e)}, status_code=500)
+
 @app.post("/vessels/chat")  # Remove {imo} from path
 async def chat_general(request_data: Dict[str, Any]):
     """Chat - checks for IMO in payload, falls back to general LLM"""

@@ -12,6 +12,7 @@ warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 warnings.filterwarnings("ignore", message=".*Please install PyTorch.*")
 
 logger.info("Loading GGUF model for LLM operations...")
+import time
 
 from llama_cpp import Llama
 
@@ -609,11 +610,13 @@ def stream_chat_response():
                     response = response.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
                     
                     # Send in reasonable chunks
-                    chunk_size = 4
+                    chunk_size = 6   #was 4
                     for i in range(0, len(response), chunk_size):
                         chunk = response[i:i + chunk_size]
                         if chunk:
                             yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
+                            time.sleep(0.03)
+
                     
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
                 
