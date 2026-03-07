@@ -14,6 +14,8 @@ import shutil
 from datetime import datetime
 import torch
 import requests
+from jit_calculator import run_jit_calculation
+import json as json_lib
 # Import all our components
 from vessel_manager import VesselSpecificManager
 from database import initialize_database, get_database_manager
@@ -941,6 +943,179 @@ Rules:
     except Exception as e:
         logger.error(f"Error in LaTeX conversion: {e}")
         return JSONResponse(content={'error': str(e)}, status_code=500)
+
+# ============= JIT RECOMMENDATION =============
+
+@app.post("/vessels/{imo}/jit/recommend")
+async def jit_recommend(imo: str, request_data: Dict[str, Any]):
+    """
+    JIT Arrival Recommendation
+    Input:  { "port_name": "Savannah", "etb": "2026-03-10T04:00:00Z" }
+    Output: instruction card JSON
+    """
+    try:
+        port_name = (request_data.get("port_name") or "").strip()
+        etb_iso   = (request_data.get("etb") or "").strip()
+
+        if not port_name:
+            raise HTTPException(status_code=400, detail="port_name is required")
+        if not etb_iso:
+            raise HTTPException(status_code=400, detail="etb is required")
+
+        # --- Load ports.json ---
+        ports_path = os.path.join(os.path.dirname(__file__), "ports.json")
+        with open(ports_path) as f:
+            ports = json_lib.load(f)
+
+        port = ports.get(port_name)
+        if not port:
+            # Try case-insensitive match
+            port_name_lower = port_name.lower()
+            for k, v in ports.items():
+                if k.lower() == port_name_lower:
+                    port = v
+                    port_name = k
+                    break
+
+        if not port or port.get("lat", 0) == 0:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Port '{port_name}' not found in ports database"
+            )
+
+        # --- Get vessel snapshot from telemetry ---
+        logger.info(f"JIT: Fetching snapshot for IMO {imo}")
+        import requests as req
+        snapshot_resp = req.post(
+            "http://localhost:5010/mcp/call",
+            json={"name": "get_jit_snapshot", "arguments": {"imo": imo}},
+            timeout=15
+        )
+        snapshot = snapshot_resp.json()
+
+        if "error" in snapshot:
+            raise HTTPException(status_code=500, detail=f"Telemetry error: {snapshot['error']}")
+
+        current = snapshot.get("current_state", {})
+        sailing = snapshot.get("sailing_averages", {})
+
+        lat = current.get("latitude")
+        lon = current.get("longitude")
+
+        if not lat or not lon:
+            raise HTTPException(status_code=500, detail="Vessel position unavailable")
+
+        # --- Run JIT math ---
+        logger.info(f"JIT: Running calculation for {imo} → {port_name}")
+        calc = run_jit_calculation(
+            imo=imo,
+            current_lat=lat,
+            current_lon=lon,
+            current_speed=current.get("sog_knots") or 0,
+            current_fuel=current.get("fuel_kgph"),
+            avg_speed=sailing.get("avg_sog_knots"),
+            avg_fuel=sailing.get("avg_fuel_kgph"),
+            destination_lat=port["lat"],
+            destination_lon=port["lon"],
+            etb_iso=etb_iso
+        )
+
+        if "error" in calc:
+            raise HTTPException(status_code=400, detail=calc["error"])
+        if calc.get("recommendation") == "IMPOSSIBLE":
+            card = {
+                "card_type":            "JIT_ARRIVAL",
+                "vessel_imo":           imo,
+                "destination_port":     port_name,
+                "etb":                  etb_iso,
+                "recommendation":       "IMPOSSIBLE",
+                "required_speed_kn":    calc["required_speed_kn"],
+                "max_speed_kn":         calc["max_speed_kn"],
+                "distance_nm":          calc["distance_to_port_nm"],
+                "hours_until_etb":      calc["hours_until_etb"],
+                "berth_confidence_pct": calc["berth_confidence_pct"],
+                "anchorage_risk_pct":   calc["anchorage_risk_pct"],
+                "instruction_text":     calc["note"],
+                "generated_at":         calc["calculated_at"],
+                "status":               "PENDING"
+            }
+            return JSONResponse(content={"data": card})    
+
+
+        # --- Generate instruction card via Qwen ---
+        logger.info(f"JIT: Generating instruction card")
+
+        SYSTEM_PROMPT = """You are a vessel operations AI generating JIT (Just-In-Time) arrival instruction cards for ship crew.
+        Write in clear, professional maritime language. Be direct and concise.
+        Plain text only. No markdown. No bullet points. No HTML."""
+        fuel_direction = "saving" if calc['fuel_saving_tonnes'] > 0 else "additional cost"
+        fuel_abs = abs(calc['fuel_saving_tonnes'])
+        fuel_usd_abs = abs(calc['fuel_saving_usd'])
+        user_prompt = f"""Generate a JIT arrival instruction card based on this data:
+
+Vessel IMO: {imo}
+Destination Port: {port_name}
+ETB (Berth Ready Time): {etb_iso}
+Current Location: {current.get('location', 'At sea')}
+Current Speed: {calc['current_speed_kn']} knots
+Recommended Speed: {calc['required_speed_kn']} knots
+Distance to Port: {calc['distance_to_port_nm']} nautical miles
+Hours Until ETB: {calc['hours_until_etb']} hours
+ETA at Current Speed: {calc['eta_at_current_speed_h']} hours from now
+Early Arrival if No Change: {calc['early_by_hours']} hours early
+Fuel at Current Speed: {calc['fuel_at_current_speed_kgph']} kg/h
+Fuel at Recommended Speed: {calc['fuel_at_required_speed_kgph']} kg/h
+Fuel {fuel_direction}: {fuel_abs} tonnes ({fuel_usd_abs} USD)
+Recommendation: {calc['recommendation']}
+Berth Confidence: {calc['berth_confidence_pct']}%
+Anchorage Risk if Ignored: {calc['anchorage_risk_pct']}%
+
+Write a short instruction card (4-6 sentences) telling the Master what to do, why, and what is saved. End with the confidence and anchorage risk."""
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user",   "content": user_prompt}
+        ]
+
+        llm_resp = req.post(
+            "http://localhost:5005/gpu/llm/generate",
+            json={"messages": messages, "response_type": "jit_card"},
+            timeout=120
+        )
+        card_text = llm_resp.json().get("response", "").strip()
+        card_text = card_text.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+
+        # --- Build final card ---
+        card = {
+            "card_type":              "JIT_ARRIVAL",
+            "vessel_imo":             imo,
+            "destination_port":       port_name,
+            "etb":                    etb_iso,
+            "recommendation":         calc["recommendation"],
+            "current_speed_kn":       calc["current_speed_kn"],
+            "required_speed_kn":      calc["required_speed_kn"],
+            "distance_nm":            calc["distance_to_port_nm"],
+            "hours_until_etb":        calc["hours_until_etb"],
+            "early_by_hours":         calc["early_by_hours"],
+            "fuel_saving_tonnes":     calc["fuel_saving_tonnes"],
+            "fuel_saving_usd":        calc["fuel_saving_usd"],
+            "berth_confidence_pct":   calc["berth_confidence_pct"],
+            "anchorage_risk_pct":     calc["anchorage_risk_pct"],
+            "instruction_text":       card_text,
+            "generated_at":           calc["calculated_at"],
+            "status":                 "PENDING"
+        }
+
+        logger.info(f"JIT card generated for {imo} → {port_name}")
+        return JSONResponse(content={"data": card})
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"JIT recommendation error: {e}")
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/vessels/chat")  # Remove {imo} from path
 async def chat_general(request_data: Dict[str, Any]):

@@ -260,7 +260,15 @@ def generate_llm_response():
         if imo and messages and messages[0].get('role') == 'system':
             messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
             Current year is 2026. When querying time ranges, use 2026.
+            When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
             Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
+            # messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
+            # Current year is 2026. When querying time ranges, use 2026.
+            # When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
+            # Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
+            # messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
+            # Current year is 2026. When querying time ranges, use 2026.
+            # Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
 
         if not messages:
             return jsonify({'error': 'No messages provided'}), 400
@@ -485,6 +493,7 @@ TOOL_STATUS_MESSAGES = {
     'query_telemetry': 'Querying vessel telemetry...',
     'search_equipment': 'Searching equipment registry...',
     'get_maintenance_schedule': 'Fetching maintenance schedule...',
+    'get_jit_snapshot': 'Fetching vessel navigation and fuel state...',
     'get_pending_jobs': 'Checking pending maintenance jobs...',
     'get_job_history': 'Retrieving maintenance history...',
     'get_running_hours': 'Fetching running hour data...',
@@ -505,7 +514,11 @@ def stream_chat_response():
         if imo and messages and messages[0].get('role') == 'system':
             messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
             Current year is 2026. When querying time ranges, use 2026.
+            When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
             Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
+            # messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
+            # Current year is 2026. When querying time ranges, use 2026.
+            # Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
 
         if not messages:
             return jsonify({'error': 'No messages provided'}), 400

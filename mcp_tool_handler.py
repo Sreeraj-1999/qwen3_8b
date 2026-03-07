@@ -50,6 +50,23 @@ TELEMETRY_TOOLS = [
         }
     },
     {
+    "type": "function",
+    "function": {
+        "name": "get_jit_snapshot",
+        "description": "Get current vessel state for JIT arrival calculation. Returns current SOG, position, fuel consumption, RPM, shaft power, and sailing averages from recent history.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "imo": {
+                    "type": "string",
+                    "description": "IMO number of the vessel"
+                }
+            },
+            "required": ["imo"]
+        }
+    }
+},
+    {
         "type": "function",
         "function": {
             "name": "get_sensor_history",
@@ -250,7 +267,7 @@ PMS_TOOL_NAMES = {
 
 TELEMETRY_TOOL_NAMES = {
     "get_latest_readings", "get_active_alarms", "get_sensor_history",
-    "get_generator_status", "query_telemetry"
+    "get_generator_status", "query_telemetry","get_jit_snapshot"
 }
 
 

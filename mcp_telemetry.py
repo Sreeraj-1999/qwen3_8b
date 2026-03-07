@@ -14,6 +14,7 @@ Database pattern:
 """
 
 from flask import Flask, request, jsonify
+import requests
 import sqlite3
 import json
 import os
@@ -28,6 +29,32 @@ app = Flask('mcp_telemetry')
 
 # Base path for all vessel databases
 DB_BASE_PATH = r"C:\Users\User\Desktop\Main Engine Diagnostics"
+
+def coords_to_place(lat, lon):
+    try:
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/reverse",
+            params={"lat": lat, "lon": lon, "format": "json"},
+            headers={"User-Agent": "MarineAI/1.0"},
+            timeout=5
+        )
+        data = r.json()
+        print("NOMINATIM RESPONSE:", data)
+        address = data.get("address", {})
+        print("ADDRESS:", address) 
+        city = (address.get("city") or 
+                address.get("town") or 
+                address.get("village") or 
+                address.get("suburb") or
+                address.get("county") or "")
+        state   = address.get("state", "")
+        country = address.get("country", "")
+        place   = ", ".join(p for p in [city, state, country] if p)
+        print("PLACE:", place)
+        return place if place else f"{lat}, {lon}"
+    except Exception as e:
+        print("COORDS ERROR:", e)
+        return f"{lat}, {lon}"
 
 # ============================================================
 # SENSOR CATEGORIES — for organized output
@@ -219,6 +246,23 @@ TOOLS = [
         }
     },
     {
+    "type": "function",
+    "function": {
+        "name": "get_jit_snapshot",
+        "description": "Get current vessel state for JIT arrival calculation. Returns current SOG, position, fuel consumption, RPM, shaft power, and sailing averages from recent history.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "imo": {
+                    "type": "string",
+                    "description": "IMO number of the vessel"
+                }
+            },
+            "required": ["imo"]
+        }
+    }
+},
+    {
         "type": "function",
         "function": {
             "name": "get_active_alarms",
@@ -357,6 +401,8 @@ def call_tool():
             return jsonify(handle_generator_status(arguments))
         elif tool_name == "query_telemetry":
             return jsonify(handle_query_telemetry(arguments))
+        elif tool_name == "get_jit_snapshot":
+            return jsonify(handle_jit_snapshot(arguments))
         else:
             return jsonify({"error": f"Unknown tool: {tool_name}"}), 400
     
@@ -407,12 +453,24 @@ def handle_latest_readings(args):
                         group_data[label] = payload[key]
                 if group_data:
                     result[group_name] = group_data
+            # Add human-readable location to navigation
+            lat = payload.get("V_GPSLAT_act_deg@LAST")
+            lon = payload.get("V_GPSLON_act_deg@LAST")
+            if lat and lon:
+                result.setdefault("navigation", {})["current_location"] = coords_to_place(lat, lon)
+
         elif category in SENSOR_GROUPS:
             group_data = {}
             for key, label in SENSOR_GROUPS[category].items():
                 if key in payload and payload[key] is not None:
                     group_data[label] = payload[key]
             result[category] = group_data
+            # Add human-readable location if navigation category
+            if category == "navigation":
+                lat = payload.get("V_GPSLAT_act_deg@LAST")
+                lon = payload.get("V_GPSLON_act_deg@LAST")
+                if lat and lon:
+                    result["navigation"]["current_location"] = coords_to_place(lat, lon)
         else:
             return {"error": f"Unknown category: {category}. Use: all, navigation, main_engine, fuel, generators, weather"}
         
@@ -740,7 +798,73 @@ def handle_query_telemetry(args):
     
     finally:
         conn.close()
-
+def handle_jit_snapshot(args):
+    """Get current vessel state for JIT calculation"""
+    imo = args.get('imo')
+    
+    conn, error = get_db_connection(imo)
+    if error:
+        return {"error": error}
+    
+    try:
+        # Get latest record
+        row = conn.execute(
+            "SELECT payload, vesselTimeStamp FROM VesselData ORDER BY vesselTimeStamp DESC LIMIT 1"
+        ).fetchone()
+        
+        if not row:
+            return {"error": "No data found"}
+        
+        payload = parse_payload(row[0])
+        if not payload:
+            return {"error": "Failed to parse payload"}
+        
+        # Get average fuel burn from last 100 SAILING records (SOG > 5)
+        rows = conn.execute(
+            "SELECT payload FROM VesselData ORDER BY vesselTimeStamp DESC LIMIT 5000"
+        ).fetchall()
+        
+        sailing_fuel = []
+        sailing_sog = []
+        for r in rows:
+            p = parse_payload(r[0])
+            if not p:
+                continue
+            sog = p.get("V_SOG_act_kn@AVG")
+            fuel = p.get("ME_FMS_act_kgPh@AVG")
+            if sog and fuel and float(sog) > 5 and float(fuel) > 0:
+                sailing_fuel.append(float(fuel))
+                sailing_sog.append(float(sog))
+            if len(sailing_fuel) >= 100:
+                break
+        
+        avg_fuel = round(sum(sailing_fuel) / len(sailing_fuel), 2) if sailing_fuel else None
+        avg_sog  = round(sum(sailing_sog)  / len(sailing_sog),  2) if sailing_sog  else None
+        
+        return {
+            "vessel_imo": imo,
+            "timestamp": row[1],
+            "current_state": {
+                "location": coords_to_place(payload.get("V_GPSLAT_act_deg@LAST"), payload.get("V_GPSLON_act_deg@LAST")),
+                "sog_knots":      payload.get("V_SOG_act_kn@AVG"),
+                "stw_knots":      payload.get("V_STW_act_kn@AVG"),
+                "rpm":            payload.get("SA_SPD_act_rpm@AVG"),
+                "shaft_power_kw": payload.get("SA_POW_act_kW@AVG"),
+                "fuel_kgph":      payload.get("ME_FMS_act_kgPh@AVG"),
+                "latitude":       payload.get("V_GPSLAT_act_deg@LAST"),
+                "longitude":      payload.get("V_GPSLON_act_deg@LAST"),
+                "heading":        payload.get("V_HDG_act_deg@AVG"),
+                "wind_direction": payload.get("WEA_WDT_act_deg@AVG"),
+            },
+            "sailing_averages": {
+                "avg_sog_knots":  avg_sog,
+                "avg_fuel_kgph":  avg_fuel,
+                "samples_used":   len(sailing_fuel)
+            }
+        }
+    
+    finally:
+        conn.close()
 
 # ============================================================
 # HEALTH CHECK
