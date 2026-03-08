@@ -21,6 +21,7 @@ import os
 import glob
 import logging
 from datetime import datetime, timedelta
+from location_resolver import resolve_location
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -30,31 +31,9 @@ app = Flask('mcp_telemetry')
 # Base path for all vessel databases
 DB_BASE_PATH = r"C:\Users\User\Desktop\Main Engine Diagnostics"
 
+
 def coords_to_place(lat, lon):
-    try:
-        r = requests.get(
-            "https://nominatim.openstreetmap.org/reverse",
-            params={"lat": lat, "lon": lon, "format": "json"},
-            headers={"User-Agent": "MarineAI/1.0"},
-            timeout=5
-        )
-        data = r.json()
-        print("NOMINATIM RESPONSE:", data)
-        address = data.get("address", {})
-        print("ADDRESS:", address) 
-        city = (address.get("city") or 
-                address.get("town") or 
-                address.get("village") or 
-                address.get("suburb") or
-                address.get("county") or "")
-        state   = address.get("state", "")
-        country = address.get("country", "")
-        place   = ", ".join(p for p in [city, state, country] if p)
-        print("PLACE:", place)
-        return place if place else f"{lat}, {lon}"
-    except Exception as e:
-        print("COORDS ERROR:", e)
-        return f"{lat}, {lon}"
+    return resolve_location(lat, lon)
 
 # ============================================================
 # SENSOR CATEGORIES — for organized output

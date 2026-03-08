@@ -1048,9 +1048,14 @@ async def jit_recommend(imo: str, request_data: Dict[str, Any]):
         SYSTEM_PROMPT = """You are a vessel operations AI generating JIT (Just-In-Time) arrival instruction cards for ship crew.
         Write in clear, professional maritime language. Be direct and concise.
         Plain text only. No markdown. No bullet points. No HTML."""
-        fuel_direction = "saving" if calc['fuel_saving_tonnes'] > 0 else "additional cost"
         fuel_abs = abs(calc['fuel_saving_tonnes'])
         fuel_usd_abs = abs(calc['fuel_saving_usd'])
+        if calc['fuel_saving_tonnes'] > 0:
+            fuel_sentence = f"Slowing down saves {fuel_abs} tonnes of fuel (approx. USD {fuel_usd_abs})."
+        elif calc['fuel_saving_tonnes'] < 0:
+            fuel_sentence = f"Speeding up costs an additional {fuel_abs} tonnes of fuel (approx. USD {fuel_usd_abs}), but ensures the vessel makes the berth window and avoids anchorage delays."
+        else:
+            fuel_sentence = "No change in fuel consumption expected."
         user_prompt = f"""Generate a JIT arrival instruction card based on this data:
 
 Vessel IMO: {imo}
@@ -1062,11 +1067,12 @@ Recommended Speed: {calc['required_speed_kn']} knots
 Distance to Port: {calc['distance_to_port_nm']} nautical miles
 Hours Until ETB: {calc['hours_until_etb']} hours
 ETA at Current Speed: {calc['eta_at_current_speed_h']} hours from now
-Early Arrival if No Change: {calc['early_by_hours']} hours early
+Early Arrival if No Change: {calc['early_by_hours']} hours early (0 means vessel is behind schedule)
 Fuel at Current Speed: {calc['fuel_at_current_speed_kgph']} kg/h
 Fuel at Recommended Speed: {calc['fuel_at_required_speed_kgph']} kg/h
-Fuel {fuel_direction}: {fuel_abs} tonnes ({fuel_usd_abs} USD)
+Fuel impact: {fuel_sentence}
 Recommendation: {calc['recommendation']}
+Note: {'Vessel must go FASTER to make ETB. Extra fuel cost applies.' if calc['recommendation'] == 'SPEED_UP' else 'Vessel can SLOW DOWN and arrive just-in-time. Fuel savings apply.' if calc['recommendation'] == 'SLOW_DOWN' else 'Current speed is fine.'}
 Berth Confidence: {calc['berth_confidence_pct']}%
 Anchorage Risk if Ignored: {calc['anchorage_risk_pct']}%
 
