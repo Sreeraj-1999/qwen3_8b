@@ -30,6 +30,42 @@ app = Flask('mcp_telemetry')
 
 # Base path for all vessel databases
 DB_BASE_PATH = r"C:\Users\User\Desktop\Main Engine Diagnostics"
+# ============================================================
+# TAG MAPPING — per-vessel key resolution
+# ============================================================
+import json as json_module
+
+_tag_mappings = None
+
+def _load_tag_mappings():
+    global _tag_mappings
+    if _tag_mappings is not None:
+        return _tag_mappings
+    mapping_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tag_mappings.json")
+    try:
+        with open(mapping_path, "r") as f:
+            _tag_mappings = json_module.load(f)
+        logger.info(f"Loaded tag mappings for {len(_tag_mappings) - 1} vessels + default")
+    except Exception as e:
+        logger.warning(f"Could not load tag_mappings.json: {e}")
+        _tag_mappings = {}
+    return _tag_mappings
+
+def get_tag(imo: str, standard_name: str) -> str:
+    """Resolve a standard tag name to the vessel-specific key.
+    Usage: get_tag("9597537", "sog") → "V.SOG.act.kn"
+           get_tag("9841938", "sog") → "V_SOG_act_kn@AVG"
+    """
+    mappings = _load_tag_mappings()
+    vessel_map = mappings.get(str(imo), mappings.get("default", {}))
+    return vessel_map.get(standard_name)
+
+def get_payload_value(payload: dict, imo: str, standard_name: str):
+    """Get a value from payload using the vessel-specific tag mapping"""
+    key = get_tag(imo, standard_name)
+    if key and key in payload:
+        return payload[key]
+    return None
 
 
 def coords_to_place(lat, lon):
@@ -433,8 +469,11 @@ def handle_latest_readings(args):
                 if group_data:
                     result[group_name] = group_data
             # Add human-readable location to navigation
-            lat = payload.get("V_GPSLAT_act_deg@LAST")
-            lon = payload.get("V_GPSLON_act_deg@LAST")
+            # lat = payload.get("V_GPSLAT_act_deg@LAST")
+            # lon = payload.get("V_GPSLON_act_deg@LAST")
+            # Add human-readable location to navigation
+            lat = get_payload_value(payload, imo, "latitude")
+            lon = get_payload_value(payload, imo, "longitude")
             if lat and lon:
                 result.setdefault("navigation", {})["current_location"] = coords_to_place(lat, lon)
 
@@ -446,8 +485,11 @@ def handle_latest_readings(args):
             result[category] = group_data
             # Add human-readable location if navigation category
             if category == "navigation":
-                lat = payload.get("V_GPSLAT_act_deg@LAST")
-                lon = payload.get("V_GPSLON_act_deg@LAST")
+                # lat = payload.get("V_GPSLAT_act_deg@LAST")
+                # lon = payload.get("V_GPSLON_act_deg@LAST")
+                # Add human-readable location to navigation
+                lat = get_payload_value(payload, imo, "latitude")
+                lon = get_payload_value(payload, imo, "longitude")
                 if lat and lon:
                     result["navigation"]["current_location"] = coords_to_place(lat, lon)
         else:
@@ -777,6 +819,74 @@ def handle_query_telemetry(args):
     
     finally:
         conn.close()
+# def handle_jit_snapshot(args):
+#     """Get current vessel state for JIT calculation"""
+#     imo = args.get('imo')
+    
+#     conn, error = get_db_connection(imo)
+#     if error:
+#         return {"error": error}
+    
+#     try:
+#         # Get latest record
+#         row = conn.execute(
+#             "SELECT payload, vesselTimeStamp FROM VesselData ORDER BY vesselTimeStamp DESC LIMIT 1"
+#         ).fetchone()
+        
+#         if not row:
+#             return {"error": "No data found"}
+        
+#         payload = parse_payload(row[0])
+#         if not payload:
+#             return {"error": "Failed to parse payload"}
+        
+#         # Get average fuel burn from last 100 SAILING records (SOG > 5)
+#         rows = conn.execute(
+#             "SELECT payload FROM VesselData ORDER BY vesselTimeStamp DESC LIMIT 5000"
+#         ).fetchall()
+        
+#         sailing_fuel = []
+#         sailing_sog = []
+#         for r in rows:
+#             p = parse_payload(r[0])
+#             if not p:
+#                 continue
+#             sog = p.get("V_SOG_act_kn@AVG")
+#             fuel = p.get("ME_FMS_act_kgPh@AVG")
+#             if sog and fuel and float(sog) > 5 and float(fuel) > 0:
+#                 sailing_fuel.append(float(fuel))
+#                 sailing_sog.append(float(sog))
+#             if len(sailing_fuel) >= 100:
+#                 break
+        
+#         avg_fuel = round(sum(sailing_fuel) / len(sailing_fuel), 2) if sailing_fuel else None
+#         avg_sog  = round(sum(sailing_sog)  / len(sailing_sog),  2) if sailing_sog  else None
+        
+#         return {
+#             "vessel_imo": imo,
+#             "timestamp": row[1],
+#             "current_state": {
+#                 "location": coords_to_place(payload.get("V_GPSLAT_act_deg@LAST"), payload.get("V_GPSLON_act_deg@LAST")),
+#                 "sog_knots":      payload.get("V_SOG_act_kn@AVG"),
+#                 "stw_knots":      payload.get("V_STW_act_kn@AVG"),
+#                 "rpm":            payload.get("SA_SPD_act_rpm@AVG"),
+#                 "shaft_power_kw": payload.get("SA_POW_act_kW@AVG"),
+#                 "fuel_kgph":      payload.get("ME_FMS_act_kgPh@AVG"),
+#                 "latitude":       payload.get("V_GPSLAT_act_deg@LAST"),
+#                 "longitude":      payload.get("V_GPSLON_act_deg@LAST"),
+#                 "heading":        payload.get("V_HDG_act_deg@AVG"),
+#                 "wind_direction": payload.get("WEA_WDT_act_deg@AVG"),
+#             },
+#             "sailing_averages": {
+#                 "avg_sog_knots":  avg_sog,
+#                 "avg_fuel_kgph":  avg_fuel,
+#                 "samples_used":   len(sailing_fuel)
+#             }
+#         }
+    
+#     finally:
+#         conn.close()
+
 def handle_jit_snapshot(args):
     """Get current vessel state for JIT calculation"""
     imo = args.get('imo')
@@ -786,7 +896,6 @@ def handle_jit_snapshot(args):
         return {"error": error}
     
     try:
-        # Get latest record
         row = conn.execute(
             "SELECT payload, vesselTimeStamp FROM VesselData ORDER BY vesselTimeStamp DESC LIMIT 1"
         ).fetchone()
@@ -797,6 +906,9 @@ def handle_jit_snapshot(args):
         payload = parse_payload(row[0])
         if not payload:
             return {"error": "Failed to parse payload"}
+        
+        lat = get_payload_value(payload, imo, "latitude")
+        lon = get_payload_value(payload, imo, "longitude")
         
         # Get average fuel burn from last 100 SAILING records (SOG > 5)
         rows = conn.execute(
@@ -809,8 +921,8 @@ def handle_jit_snapshot(args):
             p = parse_payload(r[0])
             if not p:
                 continue
-            sog = p.get("V_SOG_act_kn@AVG")
-            fuel = p.get("ME_FMS_act_kgPh@AVG")
+            sog = get_payload_value(p, imo, "sog")
+            fuel = get_payload_value(p, imo, "me_fuel")
             if sog and fuel and float(sog) > 5 and float(fuel) > 0:
                 sailing_fuel.append(float(fuel))
                 sailing_sog.append(float(sog))
@@ -818,27 +930,27 @@ def handle_jit_snapshot(args):
                 break
         
         avg_fuel = round(sum(sailing_fuel) / len(sailing_fuel), 2) if sailing_fuel else None
-        avg_sog  = round(sum(sailing_sog)  / len(sailing_sog),  2) if sailing_sog  else None
+        avg_sog = round(sum(sailing_sog) / len(sailing_sog), 2) if sailing_sog else None
         
         return {
             "vessel_imo": imo,
             "timestamp": row[1],
             "current_state": {
-                "location": coords_to_place(payload.get("V_GPSLAT_act_deg@LAST"), payload.get("V_GPSLON_act_deg@LAST")),
-                "sog_knots":      payload.get("V_SOG_act_kn@AVG"),
-                "stw_knots":      payload.get("V_STW_act_kn@AVG"),
-                "rpm":            payload.get("SA_SPD_act_rpm@AVG"),
-                "shaft_power_kw": payload.get("SA_POW_act_kW@AVG"),
-                "fuel_kgph":      payload.get("ME_FMS_act_kgPh@AVG"),
-                "latitude":       payload.get("V_GPSLAT_act_deg@LAST"),
-                "longitude":      payload.get("V_GPSLON_act_deg@LAST"),
-                "heading":        payload.get("V_HDG_act_deg@AVG"),
-                "wind_direction": payload.get("WEA_WDT_act_deg@AVG"),
+                "location": coords_to_place(lat, lon) if lat and lon else "Position unavailable",
+                "sog_knots": get_payload_value(payload, imo, "sog"),
+                "stw_knots": get_payload_value(payload, imo, "stw"),
+                "rpm": get_payload_value(payload, imo, "me_rpm"),
+                "shaft_power_kw": get_payload_value(payload, imo, "me_power"),
+                "fuel_kgph": get_payload_value(payload, imo, "me_fuel"),
+                "latitude": lat,
+                "longitude": lon,
+                "heading": get_payload_value(payload, imo, "heading"),
+                "wind_direction": get_payload_value(payload, imo, "wind_dir_true"),
             },
             "sailing_averages": {
-                "avg_sog_knots":  avg_sog,
-                "avg_fuel_kgph":  avg_fuel,
-                "samples_used":   len(sailing_fuel)
+                "avg_sog_knots": avg_sog,
+                "avg_fuel_kgph": avg_fuel,
+                "samples_used": len(sailing_fuel)
             }
         }
     
