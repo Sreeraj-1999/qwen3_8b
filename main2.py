@@ -909,27 +909,40 @@ async def convert_to_latex(request_data: Dict[str, Any]):
         
         logger.info(f"LaTeX conversion request: {condition}")
         
-        system_prompt = r"""You are a LaTeX converter. Convert the given condition into LaTeX math notation.
+#         system_prompt = r"""You are a LaTeX converter. Convert the given condition into LaTeX math notation.
 
-Rules:
-1. Output ONLY the LaTeX expression. No explanation, no preamble, no markdown, no backticks.
-2. Wrap variable/sensor names in \text{}, e.g. \text{ME_RPM}
-3. Use standard LaTeX comparison operators: >, <, \geq, \leq, =, \neq
-4. Use \land for AND, \lor for OR
-5. Keep numbers as plain numbers
-6. If multiple conditions, combine them with \land or \lor as appropriate
-7. Do NOT wrap in $ signs or \[ \] delimiters
-8. Replace @ symbols in sensor names with underscores"""
+# Rules:
+# 1. Output ONLY the LaTeX expression. No explanation, no preamble, no markdown, no backticks.
+# 2. Wrap variable/sensor names in \text{}, e.g. \text{ME_RPM}
+# 3. Use standard LaTeX comparison operators: >, <, \geq, \leq, =, \neq
+# 4. Use \land for AND, \lor for OR
+# 5. Keep numbers as plain numbers
+# 6. If multiple conditions, combine them with \land or \lor as appropriate
+# 7. Do NOT wrap in $ signs or \[ \] delimiters
+# 8. Replace @ symbols in sensor names with underscores"""
+        SYSTEM_PROMPT = r"""Convert conditions to LaTeX. Output ONLY the LaTeX expression, nothing else.
+
+        Examples:
+        Input: if @ME_RPM is greater than 100 and @V_SOG is less than 5
+        Output: \text{ME_RPM} > 100 \land \text{V_SOG} < 5
+
+        Input: if @DG5_Power_kW is more than 8 or @ME_Torque_kNm equals zero
+        Output: \text{DG5_Power_kW} > 8 \lor \text{ME_Torque_kNm} = 0
+
+        Input: if @ME_LOAD is not equal to 50 and @AE_TEMP is at least 200
+        Output: \text{ME_LOAD} \neq 50 \land \text{AE_TEMP} \geq 200
+
+        Now convert:"""
 
         messages = [
-            {'role': 'system', 'content': system_prompt},
+            {'role': 'system', 'content': SYSTEM_PROMPT},
             {'role': 'user', 'content': condition}
         ]
         
         response = requests.post(
             "http://localhost:5005/gpu/llm/generate",
             json={"messages": messages, "response_type": "latex_conversion"},
-            timeout=60
+            timeout=250
         )
         
         latex = response.json().get('response', '').strip()
@@ -1074,9 +1087,10 @@ Fuel impact: {fuel_sentence}
 Recommendation: {calc['recommendation']}
 Note: {'Vessel must go FASTER to make ETB. Extra fuel cost applies.' if calc['recommendation'] == 'SPEED_UP' else 'Vessel can SLOW DOWN and arrive just-in-time. Fuel savings apply.' if calc['recommendation'] == 'SLOW_DOWN' else 'Current speed is fine.'}
 Berth Confidence: {calc['berth_confidence_pct']}%
-Anchorage Risk if Ignored: {calc['anchorage_risk_pct']}%
+Anchorage Risk if Ignored: {calc['anchorage_risk_pct']}% (this means: if the Master does NOT follow this recommendation, there is a {calc['anchorage_risk_pct']}% chance the vessel will have to anchor and wait for the berth window)
 
 Write a short instruction card (4-6 sentences) telling the Master what to do, why, and what is saved. End with the confidence and anchorage risk."""
+# Anchorage Risk if Ignored: {calc['anchorage_risk_pct']}%
 
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},

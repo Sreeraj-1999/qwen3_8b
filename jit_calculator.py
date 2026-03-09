@@ -150,8 +150,8 @@ def run_jit_calculation(
             "max_speed_kn": MAX_SPEED_KNOTS,
             "distance_to_port_nm": distance_nm,
             "hours_until_etb": round(hours_until_etb, 2),
-            "berth_confidence_pct": confidence,
-            "anchorage_risk_pct": 10,
+            "berth_confidence_pct": 0,
+            "anchorage_risk_pct": 0,
             "etb": etb_iso,
             "calculated_at": now.isoformat()
         }
