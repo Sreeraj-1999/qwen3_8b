@@ -1003,6 +1003,8 @@ async def convert_to_latex(request_data: Dict[str, Any]):
 
 @app.post("/vessels/{imo}/jit/recommend")
 async def jit_recommend(imo: str, request_data: Dict[str, Any]):
+    logger.info(f"JIT RECOMMEND HIT - IMO: {imo}, body: {request_data}")
+
     """
     JIT Arrival Recommendation
     Input:  { "port_name": "Savannah", "etb": "2026-03-10T04:00:00Z" }
@@ -1074,6 +1076,7 @@ async def jit_recommend(imo: str, request_data: Dict[str, Any]):
             destination_lon=port["lon"],
             etb_iso=etb_iso
         )
+        logger.info(f"JIT CALC RESULT: {calc}")
 
         if "error" in calc:
             raise HTTPException(status_code=400, detail=calc["error"])
@@ -1171,7 +1174,8 @@ Write a short instruction card (4-6 sentences) telling the Master what to do, wh
         logger.info(f"JIT card generated for {imo} → {port_name}")
         return JSONResponse(content={"data": card})
 
-    except HTTPException:
+    except HTTPException as he:
+        logger.error(f"JIT HTTP ERROR - status: {he.status_code}, detail: {he.detail}")
         raise
     except Exception as e:
         logger.error(f"JIT recommendation error: {e}")

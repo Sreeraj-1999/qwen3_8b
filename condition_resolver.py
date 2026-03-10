@@ -392,13 +392,13 @@ GROUP_DESCRIPTIONS = {
 # HELPER: Detect if input is tag-based or natural language
 # ============================================================
 
-def is_tag_based(condition: str) -> bool:
-    """
-    Returns True if the condition contains explicit @TAG references.
-    e.g., "if @ME_RPM > 100" → True
-    e.g., "alert me if exhaust temp exceeds 400" → False
-    """
-    return bool(re.search(r'@\w+', condition))
+# def is_tag_based(condition: str) -> bool:
+#     """
+#     Returns True if the condition contains explicit @TAG references.
+#     e.g., "if @ME_RPM > 100" → True
+#     e.g., "alert me if exhaust temp exceeds 400" → False
+#     """
+#     return bool(re.search(r'@[\w\[]', condition))
 
 
 # ============================================================
@@ -483,6 +483,9 @@ Output: {{"rule_name":"Cyl 3 Exhaust or High Power","mode":"single","compound":{
 Input: "check if max turbocharger RPM is above 15000 and scavenge air pressure is below 2"
 Output: {{"rule_name":"TC Overspeed with Low Scav Pressure","mode":"group","compound":{{"logic":"and","conditions":[{{"group":"turbocharger","aggregation":"max","operator":"greater_than","threshold":15000}},{{"sensor_key":"@ME_SCAV_AIR_PRESS","operator":"less_than","threshold":2}}]}}}}
 
+Input: "check if cylinder 1 exhaust temp minus cylinder 3 exhaust temp is more than 50"
+Output: {{"rule_name":"Cyl 1-3 Exhaust Temp Deviation","mode":"single","sensor_key":"@exhaust_gas_after_cyl_1_temp_high - @exhaust_gas_after_cyl_3_temp_high","operator":"greater_than","threshold":50,"compound":null}}
+
 Now parse:"""
 
 
@@ -524,6 +527,13 @@ def resolve_natural_language(condition: str, llm_url: str = "http://localhost:50
         raw = re.sub(r',\s*}', '}', raw)  # trailing comma before }
         raw = re.sub(r',\s*]', ']', raw)  # trailing comma before ]
         raw = raw.replace('{{', '{').replace('}}', '}')
+        # Fix truncated JSON — count braces and close if needed
+        open_braces = raw.count('{') - raw.count('}')
+        if open_braces > 0:
+            raw = raw + '}' * open_braces
+        open_brackets = raw.count('[') - raw.count(']')
+        if open_brackets > 0:
+            raw = raw + ']' * open_brackets
 
         logger.info(f"LLM RAW OUTPUT: {raw}")
 
@@ -649,9 +659,10 @@ def _rule_to_tag_condition(rule: dict) -> str:
 def _single_condition_to_tag(cond: dict) -> str:
     """Convert a single condition to tag-based string"""
     
-    mode = cond.get("mode", "single")
-    operator = OPERATOR_SYMBOLS.get(cond.get("operator", ""), ">")
+    mode = cond.get("mode", "group" if cond.get("group") else "single")
+    operator = OPERATOR_SYMBOLS.get(cond.get("operator", ""), ">")  
     threshold = cond.get("threshold", 0)
+    logger.info(f"SINGLE_COND_DEBUG - mode: {mode}, cond: {cond}")
     
     if mode == "group":
         group = cond.get("group", "")
@@ -740,10 +751,135 @@ def convert_to_latex_local(tag_condition: str) -> str:
     
     return latex
 
+def convert_tag_condition_to_latex(tag_condition: str) -> str:
+    """Convert a resolved tag condition to LaTeX deterministically.
+    Handles @tags with special characters like @ in the middle."""
+    latex = tag_condition
+    
+    # Strip square brackets from @[TAG] format
+    latex = re.sub(r'@\[([^\]]+)\]', r'@\1', latex)
+    
+    # Remove leading 'if'
+    latex = re.sub(r'^\s*if\s+', '', latex, flags=re.IGNORECASE)
+    
+    # Handle average BEFORE tag replacement: (A + B) / N → \frac{A + B}{N}
+    frac_match = re.search(r'\(([^)]+)\)\s*/\s*(\d+)', latex)
+    if frac_match:
+        num = frac_match.group(1)
+        den = frac_match.group(2)
+        latex = latex[:frac_match.start()] + r'\frac{' + num + '}{' + den + '}' + latex[frac_match.end():]
+    
+    # Handle max/min BEFORE tag replacement
+    latex = re.sub(r'max\(([^)]+)\)', r'\\max\\left(\1\\right)', latex)
+    latex = re.sub(r'min\(([^)]+)\)', r'\\min\\left(\1\\right)', latex)
+    
+    # NOW replace @TAG with \text{TAG}
+    def replace_tag(match):
+        tag = match.group(1)
+        escaped = tag.replace('_', r'\_')
+        return r'\text{' + escaped + '}'
+    
+    latex = re.sub(r'@([\w@.]+)', replace_tag, latex)
+    
+    # Replace operators
+    latex = latex.replace(' >= ', r' \geq ')
+    latex = latex.replace(' <= ', r' \leq ')
+    latex = latex.replace(' != ', r' \neq ')
+    latex = re.sub(r'\band\b', r'\\land', latex)
+    latex = re.sub(r'\bor\b', r'\\lor', latex)
+    
+    # Clean up spaces
+    latex = re.sub(r'\s+', ' ', latex).strip()
+    
+    return latex 
+
 
 # ============================================================
 # MAIN PUBLIC FUNCTION
 # ============================================================
+
+# def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/llm/generate",
+#                       latex_url: str = None) -> dict:
+#     condition = condition.strip()
+    
+#     if not condition:
+#         return {"success": False, "error": "No condition provided"}
+    
+#     result = {
+#         "original": condition,
+#         "success": False,
+#     }
+    
+#     if is_tag_based(condition):
+#         # ===== PATH A: Has @tags — send to LLM for LaTeX =====
+#         result["input_type"] = "tag_based"
+#         result["tag_condition"] = condition
+        
+#         try:
+#             messages = [
+#                 {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+#                 {"role": "user", "content": condition}
+#             ]
+#             resp = requests.post(llm_url, json={"messages": messages, "response_type": "latex_conversion"}, timeout=60)
+#             latex = resp.json().get("response", "").strip()
+#             latex = latex.replace("```latex", "").replace("```", "").strip().strip("$")
+#             if "<think>" in latex:
+#                 latex = latex.split("</think>")[-1].strip()
+#             result["latex"] = latex
+#             result["success"] = True
+#         except Exception as e:
+#             result["error"] = f"LaTeX conversion failed: {e}"
+    
+#     else:
+#         # ===== PATH B: Natural language — resolve to tags, then deterministic LaTeX =====
+#         result["input_type"] = "natural_language"
+        
+#         nl_result = resolve_natural_language(condition, llm_url)
+        
+#         if not nl_result["success"]:
+#             if nl_result.get("raw_response"):
+#                 try:
+#                     raw = nl_result["raw_response"]
+#                     raw = raw.replace("'", '"').replace('{{', '{').replace('}}', '}')
+#                     raw = re.sub(r',\s*}', '}', raw)
+#                     raw = re.sub(r',\s*]', ']', raw)
+#                     rule = json.loads(raw)
+#                     tag_condition = _rule_to_tag_condition(rule)
+#                     result["tag_condition"] = tag_condition
+#                     result["rule"] = rule
+#                     result["warning"] = nl_result.get("error", "")
+#                 except:
+#                     pass
+            
+#             if not result.get("tag_condition"):
+#                 result["error"] = nl_result.get("error", "NL resolution failed")
+#                 return result
+#         else:
+#             result["rule"] = nl_result["rule"]
+#             result["tag_condition"] = nl_result["tag_condition"]
+        
+#         # Deterministic LaTeX conversion — no LLM needed
+#         try:
+#             latex = convert_tag_condition_to_latex(result["tag_condition"])
+#             result["latex"] = latex
+#             result["success"] = True
+#         except Exception as e:
+#             result["error"] = f"LaTeX conversion failed: {e}"
+    
+#     return result
+
+def _has_tags(condition: str) -> bool:
+    return bool(re.search(r'@[\w\[]', condition))
+
+def _is_pure_symbolic(condition: str) -> bool:
+    """Returns True ONLY if condition has tags + symbols + numbers. No words at all."""
+    cleaned = re.sub(r'@\[?[\w@.]+\]?', '', condition)  # remove tags
+    cleaned = re.sub(r'[\d.+\-*/()><=!&|,\s]', '', cleaned)  # remove symbols and numbers
+    cleaned = re.sub(r'\b(and|or|if)\b', '', cleaned, flags=re.IGNORECASE)  # remove and/or/if
+    return len(cleaned.strip()) == 0
+
+def _preprocess_condition(condition: str) -> str:
+    return re.sub(r'@\[([^\]]+)\]', r'@\1', condition)
 
 def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/llm/generate",
                       latex_url: str = None) -> dict:
@@ -752,13 +888,31 @@ def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/
     if not condition:
         return {"success": False, "error": "No condition provided"}
     
+    # Preprocess: @[TAG] → @TAG
+    condition = _preprocess_condition(condition)
+    
     result = {
         "original": condition,
         "success": False,
     }
     
-    if is_tag_based(condition):
-        # ===== PATH A: Has @tags — send straight to LLM for LaTeX =====
+    has_tags = _has_tags(condition)
+    symbolic = _is_pure_symbolic(condition) if has_tags else False
+    
+    if has_tags and symbolic:
+        # ===== PATH A: @TAG > 100 style — pure deterministic =====
+        result["input_type"] = "tag_based"
+        result["tag_condition"] = condition
+        
+        try:
+            latex = convert_tag_condition_to_latex(condition)
+            result["latex"] = latex
+            result["success"] = True
+        except Exception as e:
+            result["error"] = f"LaTeX conversion failed: {e}"
+    
+    elif has_tags and not symbolic:
+        # ===== PATH B: @TAG is greater than 100 style — LLM for LaTeX =====
         result["input_type"] = "tag_based"
         result["tag_condition"] = condition
         
@@ -778,20 +932,24 @@ def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/
             result["error"] = f"LaTeX conversion failed: {e}"
     
     else:
-        # ===== PATH B: Natural language — resolve to tags, then LaTeX =====
+        # ===== PATH C: Natural language — resolve to tags, then deterministic LaTeX =====
         result["input_type"] = "natural_language"
         
         nl_result = resolve_natural_language(condition, llm_url)
         
         if not nl_result["success"]:
-            # Validation failed but we still try to make LaTeX from whatever we got
             if nl_result.get("raw_response"):
-                # Try to extract any tag condition from the raw response and convert anyway
                 try:
                     raw = nl_result["raw_response"]
                     raw = raw.replace("'", '"').replace('{{', '{').replace('}}', '}')
                     raw = re.sub(r',\s*}', '}', raw)
                     raw = re.sub(r',\s*]', ']', raw)
+                    open_braces = raw.count('{') - raw.count('}')
+                    if open_braces > 0:
+                        raw = raw + '}' * open_braces
+                    open_brackets = raw.count('[') - raw.count(']')
+                    if open_brackets > 0:
+                        raw = raw + ']' * open_brackets
                     rule = json.loads(raw)
                     tag_condition = _rule_to_tag_condition(rule)
                     result["tag_condition"] = tag_condition
@@ -803,28 +961,18 @@ def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/
             if not result.get("tag_condition"):
                 result["error"] = nl_result.get("error", "NL resolution failed")
                 return result
+        else:
+            result["rule"] = nl_result["rule"]
+            result["tag_condition"] = nl_result["tag_condition"]
         
-        result["rule"] = nl_result["rule"]
-        result["tag_condition"] = nl_result["tag_condition"]
-        
-        # Now send the resolved tag condition to LLM for LaTeX
         try:
-            messages = [
-                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-                {"role": "user", "content": nl_result["tag_condition"]}
-            ]
-            resp = requests.post(llm_url, json={"messages": messages, "response_type": "latex_conversion"}, timeout=60)
-            latex = resp.json().get("response", "").strip()
-            latex = latex.replace("```latex", "").replace("```", "").strip().strip("$")
-            if "<think>" in latex:
-                latex = latex.split("</think>")[-1].strip()
+            latex = convert_tag_condition_to_latex(result["tag_condition"])
             result["latex"] = latex
             result["success"] = True
         except Exception as e:
             result["error"] = f"LaTeX conversion failed: {e}"
     
     return result
-
 
 # ============================================================
 # QUICK TEST
