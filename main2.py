@@ -898,63 +898,105 @@ async def simple_transcription(audio: UploadFile = File(...)):
             status_code=500
         )
 
+# @app.post("/convert/latex")
+# async def convert_to_latex(request_data: Dict[str, Any]):
+#     """Convert condition expressions to LaTeX format"""
+#     try:
+#         condition = (request_data.get('condition') or '').strip()
+        
+#         if not condition:
+#             return JSONResponse(content={'error': 'No condition provided.'}, status_code=400)
+        
+#         logger.info(f"LaTeX conversion request: {condition}")
+        
+# #         system_prompt = r"""You are a LaTeX converter. Convert the given condition into LaTeX math notation.
+
+# # Rules:
+# # 1. Output ONLY the LaTeX expression. No explanation, no preamble, no markdown, no backticks.
+# # 2. Wrap variable/sensor names in \text{}, e.g. \text{ME_RPM}
+# # 3. Use standard LaTeX comparison operators: >, <, \geq, \leq, =, \neq
+# # 4. Use \land for AND, \lor for OR
+# # 5. Keep numbers as plain numbers
+# # 6. If multiple conditions, combine them with \land or \lor as appropriate
+# # 7. Do NOT wrap in $ signs or \[ \] delimiters
+# # 8. Replace @ symbols in sensor names with underscores"""
+#         SYSTEM_PROMPT = r"""Convert conditions to LaTeX. Output ONLY the LaTeX expression, nothing else.
+
+#         Examples:
+#         Input: if @ME_RPM is greater than 100 and @V_SOG is less than 5
+#         Output: \text{ME_RPM} > 100 \land \text{V_SOG} < 5
+
+#         Input: if @DG5_Power_kW is more than 8 or @ME_Torque_kNm equals zero
+#         Output: \text{DG5_Power_kW} > 8 \lor \text{ME_Torque_kNm} = 0
+
+#         Input: if @ME_LOAD is not equal to 50 and @AE_TEMP is at least 200
+#         Output: \text{ME_LOAD} \neq 50 \land \text{AE_TEMP} \geq 200
+
+#         Now convert:"""
+
+#         messages = [
+#             {'role': 'system', 'content': SYSTEM_PROMPT},
+#             {'role': 'user', 'content': condition}
+#         ]
+        
+#         response = requests.post(
+#             "http://localhost:5005/gpu/llm/generate",
+#             json={"messages": messages, "response_type": "latex_conversion"},
+#             timeout=250
+#         )
+        
+#         latex = response.json().get('response', '').strip()
+        
+#         # Clean any accidental wrapping
+#         latex = latex.replace('```latex', '').replace('```', '').strip()
+#         latex = latex.strip('$').strip()
+        
+#         return JSONResponse(content={'latex': latex})
+        
+#     except Exception as e:
+#         logger.error(f"Error in LaTeX conversion: {e}")
+#         return JSONResponse(content={'error': str(e)}, status_code=500)
+
+from condition_resolver import resolve_condition
+
 @app.post("/convert/latex")
 async def convert_to_latex(request_data: Dict[str, Any]):
-    """Convert condition expressions to LaTeX format"""
+    """Convert condition expressions to LaTeX format.
+    Handles both:
+      - Tag-based: "if @ME_RPM > 100 and @V_SOG < 5"
+      - Natural language: "alert me if average exhaust temp exceeds 400"
+    """
     try:
         condition = (request_data.get('condition') or '').strip()
         
         if not condition:
             return JSONResponse(content={'error': 'No condition provided.'}, status_code=400)
         
-        logger.info(f"LaTeX conversion request: {condition}")
+        logger.info(f"Condition resolve request: {condition}")
         
-#         system_prompt = r"""You are a LaTeX converter. Convert the given condition into LaTeX math notation.
-
-# Rules:
-# 1. Output ONLY the LaTeX expression. No explanation, no preamble, no markdown, no backticks.
-# 2. Wrap variable/sensor names in \text{}, e.g. \text{ME_RPM}
-# 3. Use standard LaTeX comparison operators: >, <, \geq, \leq, =, \neq
-# 4. Use \land for AND, \lor for OR
-# 5. Keep numbers as plain numbers
-# 6. If multiple conditions, combine them with \land or \lor as appropriate
-# 7. Do NOT wrap in $ signs or \[ \] delimiters
-# 8. Replace @ symbols in sensor names with underscores"""
-        SYSTEM_PROMPT = r"""Convert conditions to LaTeX. Output ONLY the LaTeX expression, nothing else.
-
-        Examples:
-        Input: if @ME_RPM is greater than 100 and @V_SOG is less than 5
-        Output: \text{ME_RPM} > 100 \land \text{V_SOG} < 5
-
-        Input: if @DG5_Power_kW is more than 8 or @ME_Torque_kNm equals zero
-        Output: \text{DG5_Power_kW} > 8 \lor \text{ME_Torque_kNm} = 0
-
-        Input: if @ME_LOAD is not equal to 50 and @AE_TEMP is at least 200
-        Output: \text{ME_LOAD} \neq 50 \land \text{AE_TEMP} \geq 200
-
-        Now convert:"""
-
-        messages = [
-            {'role': 'system', 'content': SYSTEM_PROMPT},
-            {'role': 'user', 'content': condition}
-        ]
-        
-        response = requests.post(
-            "http://localhost:5005/gpu/llm/generate",
-            json={"messages": messages, "response_type": "latex_conversion"},
-            timeout=250
+        result = resolve_condition(
+            condition,
+            llm_url="http://localhost:5005/gpu/llm/generate",
+            latex_url="http://localhost:5020/convert/latex"
         )
         
-        latex = response.json().get('response', '').strip()
+        if not result["success"]:
+            return JSONResponse(content={'error': result.get('error', 'Conversion failed')}, status_code=400)
         
-        # Clean any accidental wrapping
-        latex = latex.replace('```latex', '').replace('```', '').strip()
-        latex = latex.strip('$').strip()
+        response_data = {
+            'latex': result['latex'],
+            'input_type': result['input_type'],
+            'tag_condition': result.get('tag_condition', ''),
+        }
         
-        return JSONResponse(content={'latex': latex})
+        # Include structured rule if natural language was resolved
+        if result.get('rule'):
+            response_data['rule'] = result['rule']
+        
+        return JSONResponse(content=response_data)
         
     except Exception as e:
-        logger.error(f"Error in LaTeX conversion: {e}")
+        logger.error(f"Error in condition resolution: {e}")
         return JSONResponse(content={'error': str(e)}, status_code=500)
 
 # ============= JIT RECOMMENDATION =============
