@@ -312,7 +312,9 @@ def generate_llm_response():
         )
 
         # Generate with GGUF
-        response = gguf_generate(text, max_tokens=1024, temperature=0.1)
+        max_tok = data.get('max_tokens', 1024)
+        # response = gguf_generate(text, max_tokens=1024, temperature=0.1)
+        response = gguf_generate(text, max_tokens=max_tok, temperature=0.1)
         if "<tool_call>" in response:
             tool_name, tool_args = parse_tool_call(response)
             if tool_name:

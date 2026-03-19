@@ -28,10 +28,11 @@ Input: if @ME_RPM is greater than 100 and @V_SOG is less than 5
 Output: \text{ME_RPM} > 100 \land \text{V_SOG} < 5
 
 Input: if @DG5_Power_kW is more than 8 or @ME_Torque_kNm equals zero
-Output: \text{DG5_Power_kW} > 8 \lor \text{ME_Torque_kNm} = 0
+Output: \text{DG5_Power_kW} > 8 \lor \text{ME_Torque_kNm} = 0 
 
 Input: if @ME_LOAD is not equal to 50 and @AE_TEMP is at least 200
 Output: \text{ME_LOAD} \neq 50 \land \text{AE_TEMP} \geq 200
+
 
 Now convert:"""
 
@@ -389,19 +390,6 @@ GROUP_DESCRIPTIONS = {
 
 
 # ============================================================
-# HELPER: Detect if input is tag-based or natural language
-# ============================================================
-
-# def is_tag_based(condition: str) -> bool:
-#     """
-#     Returns True if the condition contains explicit @TAG references.
-#     e.g., "if @ME_RPM > 100" → True
-#     e.g., "alert me if exhaust temp exceeds 400" → False
-#     """
-#     return bool(re.search(r'@[\w\[]', condition))
-
-
-# ============================================================
 # HELPER: Get keys by group
 # ============================================================
 
@@ -651,6 +639,12 @@ def _rule_to_tag_condition(rule: dict) -> str:
         compound = rule["compound"]
         logic = " and " if compound["logic"] == "and" else " or "
         parts = [_single_condition_to_tag(c) for c in compound["conditions"]]
+        
+        # Check if top-level also has a sensor_key (LLM sometimes splits conditions)
+        if (rule.get("sensor_key") or rule.get("group")) and rule.get("operator"):
+            top_part = _single_condition_to_tag(rule)
+            parts.insert(0, top_part)
+        
         return logic.join(parts)
     
     return _single_condition_to_tag(rule)
@@ -678,10 +672,10 @@ def _single_condition_to_tag(cond: dict) -> str:
         
         if agg == "any":
             parts = [f"@{k} {operator} {threshold}" for k in keys]
-            return " or ".join(parts)
+            return "(" + " or ".join(parts) + ")"
         elif agg == "all":
             parts = [f"@{k} {operator} {threshold}" for k in keys]
-            return " and ".join(parts)
+            return "(" + " and ".join(parts) + ")"
         elif agg == "average":
             return f"({tag_refs}) / {count} {operator} {threshold}"
         elif agg == "max":
@@ -763,8 +757,17 @@ def convert_tag_condition_to_latex(tag_condition: str) -> str:
     latex = re.sub(r'^\s*if\s+', '', latex, flags=re.IGNORECASE)
     
     # Handle average BEFORE tag replacement: (A + B) / N → \frac{A + B}{N}
-    frac_match = re.search(r'\(([^)]+)\)\s*/\s*(\d+)', latex)
-    if frac_match:
+    # frac_match = re.search(r'\(([^)]+)\)\s*/\s*(\d+)', latex)
+    # if frac_match:
+    #     num = frac_match.group(1)
+    #     den = frac_match.group(2)
+    #     latex = latex[:frac_match.start()] + r'\frac{' + num + '}{' + den + '}' + latex[frac_match.end():]
+    # Handle average BEFORE tag replacement: (A + B) / N → \frac{A + B}{N}
+    # Loop to catch ALL fraction patterns, not just the first
+    while True:
+        frac_match = re.search(r'\(([^)]+)\)\s*/\s*(\d+)', latex)
+        if not frac_match:
+            break
         num = frac_match.group(1)
         den = frac_match.group(2)
         latex = latex[:frac_match.start()] + r'\frac{' + num + '}{' + den + '}' + latex[frac_match.end():]
@@ -794,79 +797,6 @@ def convert_tag_condition_to_latex(tag_condition: str) -> str:
     return latex 
 
 
-# ============================================================
-# MAIN PUBLIC FUNCTION
-# ============================================================
-
-# def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/llm/generate",
-#                       latex_url: str = None) -> dict:
-#     condition = condition.strip()
-    
-#     if not condition:
-#         return {"success": False, "error": "No condition provided"}
-    
-#     result = {
-#         "original": condition,
-#         "success": False,
-#     }
-    
-#     if is_tag_based(condition):
-#         # ===== PATH A: Has @tags — send to LLM for LaTeX =====
-#         result["input_type"] = "tag_based"
-#         result["tag_condition"] = condition
-        
-#         try:
-#             messages = [
-#                 {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-#                 {"role": "user", "content": condition}
-#             ]
-#             resp = requests.post(llm_url, json={"messages": messages, "response_type": "latex_conversion"}, timeout=60)
-#             latex = resp.json().get("response", "").strip()
-#             latex = latex.replace("```latex", "").replace("```", "").strip().strip("$")
-#             if "<think>" in latex:
-#                 latex = latex.split("</think>")[-1].strip()
-#             result["latex"] = latex
-#             result["success"] = True
-#         except Exception as e:
-#             result["error"] = f"LaTeX conversion failed: {e}"
-    
-#     else:
-#         # ===== PATH B: Natural language — resolve to tags, then deterministic LaTeX =====
-#         result["input_type"] = "natural_language"
-        
-#         nl_result = resolve_natural_language(condition, llm_url)
-        
-#         if not nl_result["success"]:
-#             if nl_result.get("raw_response"):
-#                 try:
-#                     raw = nl_result["raw_response"]
-#                     raw = raw.replace("'", '"').replace('{{', '{').replace('}}', '}')
-#                     raw = re.sub(r',\s*}', '}', raw)
-#                     raw = re.sub(r',\s*]', ']', raw)
-#                     rule = json.loads(raw)
-#                     tag_condition = _rule_to_tag_condition(rule)
-#                     result["tag_condition"] = tag_condition
-#                     result["rule"] = rule
-#                     result["warning"] = nl_result.get("error", "")
-#                 except:
-#                     pass
-            
-#             if not result.get("tag_condition"):
-#                 result["error"] = nl_result.get("error", "NL resolution failed")
-#                 return result
-#         else:
-#             result["rule"] = nl_result["rule"]
-#             result["tag_condition"] = nl_result["tag_condition"]
-        
-#         # Deterministic LaTeX conversion — no LLM needed
-#         try:
-#             latex = convert_tag_condition_to_latex(result["tag_condition"])
-#             result["latex"] = latex
-#             result["success"] = True
-#         except Exception as e:
-#             result["error"] = f"LaTeX conversion failed: {e}"
-    
-#     return result
 
 def _has_tags(condition: str) -> bool:
     return bool(re.search(r'@[\w\[]', condition))
@@ -880,6 +810,107 @@ def _is_pure_symbolic(condition: str) -> bool:
 
 def _preprocess_condition(condition: str) -> str:
     return re.sub(r'@\[([^\]]+)\]', r'@\1', condition)
+
+DIRECT_LATEX_PROMPT = r"""You are a maritime engineering math expert. Convert conditions into executable math expressions.
+
+You will output ONLY a JSON object with two fields:
+1. "tag_condition": the math expression using @sensor_tags that can be evaluated against real data
+2. "latex": the same expression in LaTeX notation
+
+RULES FOR tag_condition:
+- Use @exact_sensor_name for sensor references
+- Use standard math: +, -, *, /, >, <, >=, <=, !=, ==
+- Use abs() for absolute value
+- Use and, or for logic
+- Use ( ) for grouping
+- The expression must be evaluatable by substituting @tags with numbers
+
+RULES FOR latex:
+- Wrap sensor names in \text{} with underscores escaped as \_
+- Use \frac{}{} for fractions
+- Use \left| \right| for absolute value
+- Use \bar{} for mean
+- Use \land for AND, \lor for OR
+- Use \geq, \leq, \neq for comparisons
+- Use \forall, \exists if needed
+
+AVAILABLE SENSORS:
+Cylinder exhaust temps: exhaust_gas_after_cyl_1_temp_high, exhaust_gas_after_cyl_2_temp_high, exhaust_gas_after_cyl_3_temp_high, exhaust_gas_after_cyl_4_temp_high, exhaust_gas_after_cyl_5_temp_high
+Piston cooling temps: cyl_1_piston_cooling_oil_outlet_temp_high through cyl_5_piston_cooling_oil_outlet_temp_high
+Jacket cooling temps: cyl_1_jacket_cooling_water_outlet_temp_high through cyl_5_jacket_cooling_water_outlet_temp_high
+Scavenge air temps: scavenge_air_box_1_temp_high through scavenge_air_box_5_temp_high
+ME core: M_E_ENGINE_RPM, M_E_shaft_power, SA_POW_act_kW@AVG, SA_SPD_act_rpm@AVG, SA_TQU_act_kNm@AVG
+Pressures: ME_SCAV_AIR_PRESS, lube_oil_press_T_C_inlet_low
+Fuel: ME_FMS_act_kgPh@AVG, AE_FMS_act_kgPh@AVG
+TC: M_E_T_C_RPM, T_C_inlet_exhaust_gas_temp_high, T_C_outlet_exhaust_gas_temp_high
+
+OUTPUT FORMAT (JSON only, no backticks, no explanation):
+{"tag_condition": "...", "latex": "..."}
+
+Example:
+Input: "If mean of all cylinder exhaust temps exceeds any individual cylinder by more than 20%, alert"
+tag_condition: (@exhaust_gas_after_cyl_1_temp_high + @exhaust_gas_after_cyl_2_temp_high + @exhaust_gas_after_cyl_3_temp_high + @exhaust_gas_after_cyl_4_temp_high + @exhaust_gas_after_cyl_5_temp_high) / 5 > 1.2 * @exhaust_gas_after_cyl_1_temp_high or (@exhaust_gas_after_cyl_1_temp_high + @exhaust_gas_after_cyl_2_temp_high + @exhaust_gas_after_cyl_3_temp_high + @exhaust_gas_after_cyl_4_temp_high + @exhaust_gas_after_cyl_5_temp_high) / 5 > 1.2 * @exhaust_gas_after_cyl_2_temp_high or (@exhaust_gas_after_cyl_1_temp_high + @exhaust_gas_after_cyl_2_temp_high + @exhaust_gas_after_cyl_3_temp_high + @exhaust_gas_after_cyl_4_temp_high + @exhaust_gas_after_cyl_5_temp_high) / 5 > 1.2 * @exhaust_gas_after_cyl_3_temp_high or (@exhaust_gas_after_cyl_1_temp_high + @exhaust_gas_after_cyl_2_temp_high + @exhaust_gas_after_cyl_3_temp_high + @exhaust_gas_after_cyl_4_temp_high + @exhaust_gas_after_cyl_5_temp_high) / 5 > 1.2 * @exhaust_gas_after_cyl_4_temp_high or (@exhaust_gas_after_cyl_1_temp_high + @exhaust_gas_after_cyl_2_temp_high + @exhaust_gas_after_cyl_3_temp_high + @exhaust_gas_after_cyl_4_temp_high + @exhaust_gas_after_cyl_5_temp_high) / 5 > 1.2 * @exhaust_gas_after_cyl_5_temp_high
+
+Now convert:"""
+
+
+def _direct_resolve(condition: str, llm_url: str) -> dict:
+    """For complex conditions that don't fit the structured schema.
+    LLM generates both tag_condition and latex directly."""
+    messages = [
+        {"role": "system", "content": DIRECT_LATEX_PROMPT},
+        {"role": "user", "content": condition}
+    ]
+    
+    try:
+        # resp = requests.post(llm_url, json={"messages": messages, "response_type": "direct_latex"}, timeout=120)
+        resp = requests.post(llm_url, json={"messages": messages, "response_type": "direct_latex", "max_tokens": 2100}, timeout=120)
+        raw = resp.json().get("response", "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        if "<think>" in raw:
+            raw = raw.split("</think>")[-1].strip()
+        raw = raw.replace("'", '"')
+        raw = re.sub(r',\s*}', '}', raw)
+        
+        logger.info(f"DIRECT RESOLVE RAW: {raw}")
+        
+        # parsed = json.loads(raw)
+        # Fix: LaTeX backslashes break JSON parsing — extract fields manually
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            # JSON failed — extract tag_condition manually, generate LaTeX ourselves
+            tc_start = raw.find('"tag_condition"')
+            if tc_start != -1:
+                tc_val_start = raw.index('"', raw.index(':', tc_start)) + 1
+                # Find the end — look for ", "latex" or end of string
+                tc_val_end = raw.find('", "latex"', tc_val_start)
+                if tc_val_end == -1:
+                    tc_val_end = raw.find('"}', tc_val_start)
+                if tc_val_end == -1:
+                    tc_val_end = raw.rfind('"')
+                tag_cond = raw[tc_val_start:tc_val_end]
+                parsed = {"tag_condition": tag_cond, "latex": ""}
+            else:
+                raise
+        tag_cond = parsed.get("tag_condition", "")
+        latex = parsed.get("latex", "")
+        
+        # If latex is empty or truncated, generate from tag_condition
+        if tag_cond :
+            try:
+                latex = convert_tag_condition_to_latex(tag_cond)
+            except:
+                latex = tag_cond  # worst case, return raw tag condition
+        
+        return {
+            "success": True,
+            "tag_condition": tag_cond,
+            "latex": latex
+        }
+    except Exception as e:
+        logger.error(f"Direct resolve failed: {e}")
+        return {"success": False, "error": str(e)}
 
 def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/llm/generate",
                       latex_url: str = None) -> dict:
@@ -911,60 +942,100 @@ def resolve_condition(condition: str, llm_url: str = "http://localhost:5005/gpu/
         except Exception as e:
             result["error"] = f"LaTeX conversion failed: {e}"
     
-    elif has_tags and not symbolic:
-        # ===== PATH B: @TAG is greater than 100 style — LLM for LaTeX =====
-        result["input_type"] = "tag_based"
-        result["tag_condition"] = condition
+    # elif has_tags and not symbolic:
+    #     # ===== PATH B: @TAG is greater than 100 style — LLM for LaTeX =====
+    #     result["input_type"] = "tag_based"
+    #     result["tag_condition"] = condition
         
-        try:
-            messages = [
-                {"role": "system", "content": LATEX_SYSTEM_PROMPT},
-                {"role": "user", "content": condition}
-            ]
-            resp = requests.post(llm_url, json={"messages": messages, "response_type": "latex_conversion"}, timeout=60)
-            latex = resp.json().get("response", "").strip()
-            latex = latex.replace("```latex", "").replace("```", "").strip().strip("$")
-            if "<think>" in latex:
-                latex = latex.split("</think>")[-1].strip()
-            result["latex"] = latex
-            result["success"] = True
-        except Exception as e:
-            result["error"] = f"LaTeX conversion failed: {e}"
+    #     try:
+    #         messages = [
+    #             {"role": "system", "content": LATEX_SYSTEM_PROMPT},
+    #             {"role": "user", "content": condition}
+    #         ]
+    #         resp = requests.post(llm_url, json={"messages": messages, "response_type": "latex_conversion"}, timeout=60)
+    #         latex = resp.json().get("response", "").strip()
+    #         latex = latex.replace("```latex", "").replace("```", "").strip().strip("$")
+    #         if "<think>" in latex:
+    #             latex = latex.split("</think>")[-1].strip()
+    #         result["latex"] = latex
+    #         result["success"] = True
+    #     except Exception as e:
+    #         result["error"] = f"LaTeX conversion failed: {e}"
     
     else:
-        # ===== PATH C: Natural language — resolve to tags, then deterministic LaTeX =====
+        # ===== PATH C: Natural language =====
         result["input_type"] = "natural_language"
         
         nl_result = resolve_natural_language(condition, llm_url)
         
         if not nl_result["success"]:
-            if nl_result.get("raw_response"):
-                try:
-                    raw = nl_result["raw_response"]
-                    raw = raw.replace("'", '"').replace('{{', '{').replace('}}', '}')
-                    raw = re.sub(r',\s*}', '}', raw)
-                    raw = re.sub(r',\s*]', ']', raw)
-                    open_braces = raw.count('{') - raw.count('}')
-                    if open_braces > 0:
-                        raw = raw + '}' * open_braces
-                    open_brackets = raw.count('[') - raw.count(']')
-                    if open_brackets > 0:
-                        raw = raw + ']' * open_brackets
-                    rule = json.loads(raw)
-                    tag_condition = _rule_to_tag_condition(rule)
-                    result["tag_condition"] = tag_condition
-                    result["rule"] = rule
-                    result["warning"] = nl_result.get("error", "")
-                except:
-                    pass
-            
-            if not result.get("tag_condition"):
-                result["error"] = nl_result.get("error", "NL resolution failed")
-                return result
-        else:
-            result["rule"] = nl_result["rule"]
-            result["tag_condition"] = nl_result["tag_condition"]
+            # Schema-based failed — try direct mode
+            logger.info("Schema resolution failed, trying direct mode")
+            direct = _direct_resolve(condition, llm_url)
+            if direct["success"]:
+                result["tag_condition"] = direct["tag_condition"]
+                result["latex"] = direct["latex"]
+                result["latex_source"] = "direct"
+                result["success"] = True
+            else:
+                result["error"] = nl_result.get("error", "Resolution failed")
+            return result
         
+        # result["rule"] = nl_result["rule"]
+        # result["tag_condition"] = nl_result["tag_condition"]
+        # Check if the schema oversimplified a complex query BEFORE setting result
+        rule = nl_result["rule"]
+        is_complex = (
+            "percent" in condition.lower() or
+            "%" in condition or
+            "maximum" in condition.lower() or
+            "minimum" in condition.lower() or
+            "deviation" in condition.lower() or
+            "difference" in condition.lower() or
+            "minus" in condition.lower() or
+            "exceeding" in condition.lower() or
+            "compared to" in condition.lower() or
+            "ratio" in condition.lower() or
+            "rate of change" in condition.lower() or
+            "average by" in condition.lower() or
+            "mean by" in condition.lower() or
+            "greater than the" in condition.lower() or
+            "more than the" in condition.lower()
+        )
+        
+        if is_complex:
+            logger.info("Complex condition detected — using direct mode")
+            direct = _direct_resolve(condition, llm_url)
+            if direct["success"] and direct["tag_condition"]:
+                result["tag_condition"] = direct["tag_condition"]
+                try:
+                    result["latex"] = convert_tag_condition_to_latex(direct["tag_condition"])
+                except:
+                    result["latex"] = direct.get("latex", direct["tag_condition"])
+                result["latex_source"] = "direct"
+                result["success"] = True
+                return result
+        
+        result["rule"] = nl_result["rule"]
+        result["tag_condition"] = nl_result["tag_condition"]
+
+        # Quality check — if tag_condition looks malformed, try direct mode
+        tc = result.get("tag_condition", "")
+        if tc and ("UNKNOWN_GROUP" in tc or ", @" in tc or ",@" in tc or tc.count("@") == 0):
+            logger.info("Malformed tag_condition detected — falling back to direct mode")
+            direct = _direct_resolve(condition, llm_url)
+            if direct["success"] and direct["tag_condition"]:
+                result["tag_condition"] = direct["tag_condition"]
+                try:
+                    result["latex"] = convert_tag_condition_to_latex(direct["tag_condition"])
+                except:
+                    result["latex"] = direct.get("latex", direct["tag_condition"])
+                result["latex_source"] = "direct"
+                result["success"] = True
+                return result
+        
+        
+        # Standard path — deterministic LaTeX from tag_condition
         try:
             latex = convert_tag_condition_to_latex(result["tag_condition"])
             result["latex"] = latex
@@ -1007,5 +1078,5 @@ if __name__ == "__main__":
     ]
     
     for cond in nl_tests:
-        detected = "TAG-BASED" if is_tag_based(cond) else "NATURAL LANGUAGE"
+        detected = "TAG-BASED" if _has_tags(cond) else "NATURAL LANGUAGE"
         print(f"  '{cond[:60]}...' → {detected}")

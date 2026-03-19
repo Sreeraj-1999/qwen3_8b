@@ -1011,6 +1011,7 @@ async def jit_recommend(imo: str, request_data: Dict[str, Any]):
     Output: instruction card JSON
     """
     try:
+        print(request_data)
         port_name = (request_data.get("port_name") or "").strip()
         etb_iso   = (request_data.get("etb") or "").strip()
 
@@ -1035,43 +1036,101 @@ async def jit_recommend(imo: str, request_data: Dict[str, Any]):
                     break
 
         if not port or port.get("lat", 0) == 0:
-            raise HTTPException(
-                status_code=404,
-                detail=f"Port '{port_name}' not found in ports database"
-            )
+            available_ports = list(ports.keys())[:20]
+            return JSONResponse(content={
+                "data": {
+                    "card_type": "JIT_ARRIVAL",
+                    "vessel_imo": imo,
+                    "recommendation": "ERROR",
+                    "instruction_text": f"Port '{port_name}' not found in the database. Please check the spelling or choose from available ports.",
+                    "available_ports_sample": available_ports,
+                    "status": "ERROR"
+                }
+            })
 
         # --- Get vessel snapshot from telemetry ---
-        logger.info(f"JIT: Fetching snapshot for IMO {imo}")
-        import requests as req
-        snapshot_resp = req.post(
-            "http://localhost:5010/mcp/call",
-            json={"name": "get_jit_snapshot", "arguments": {"imo": imo}},
-            timeout=15
-        )
-        snapshot = snapshot_resp.json()
+        # logger.info(f"JIT: Fetching snapshot for IMO {imo}")    #################
+        # import requests as req
+        # snapshot_resp = req.post(
+        #     "http://localhost:5010/mcp/call",
+        #     json={"name": "get_jit_snapshot", "arguments": {"imo": imo}},
+        #     timeout=15
+        # )
+        # snapshot = snapshot_resp.json()
 
-        if "error" in snapshot:
-            raise HTTPException(status_code=500, detail=f"Telemetry error: {snapshot['error']}")
-
-        current = snapshot.get("current_state", {})
-        sailing = snapshot.get("sailing_averages", {})
-
-        lat = current.get("latitude")
-        lon = current.get("longitude")
+        # if "error" in snapshot:
+        #     raise HTTPException(status_code=500, detail=f"Telemetry error: {snapshot['error']}")#########
+        # --- Get vessel state from request payload ---
+        # lat = request_data.get("latitude")
+        # lon = request_data.get("longitude")
+        # sog = request_data.get("sog")
+        # fuel = request_data.get("fuel_kgph")
+        # heading = request_data.get("heading")
+        lat = request_data.get("latitude") or request_data.get("lat")
+        lon = request_data.get("longitude") or request_data.get("lon")
+        sog = request_data.get("sog")
+        fuel = request_data.get("fuel_kgph") or request_data.get("fuel_consumption")
+        heading = request_data.get("heading")
+        current = {
+            'location': f"{float(lat):.4f}°N, {float(lon):.4f}°E"
+        }
 
         if not lat or not lon:
-            raise HTTPException(status_code=500, detail="Vessel position unavailable")
+            raise HTTPException(status_code=400, detail="latitude and longitude are required")
+
+        # If vessel is in port (SOG ~ 0), fetch sailing averages from telemetry
+        vessel_in_port = (sog is None or float(sog) < 2)
+        avg_speed = None
+        avg_fuel = None
+
+        if vessel_in_port:
+            logger.info(f"JIT: Vessel appears to be in port (SOG={sog}), fetching sailing averages")
+            try:
+                import requests as req
+                snapshot_resp = req.post(
+                    "http://localhost:5010/mcp/call",
+                    json={"name": "get_jit_snapshot", "arguments": {"imo": imo}},
+                    timeout=15
+                )
+                snapshot = snapshot_resp.json()
+                sailing = snapshot.get("sailing_averages", {})
+                avg_speed = sailing.get("avg_sog_knots")
+                avg_fuel = sailing.get("avg_fuel_kgph")
+            except Exception as e:
+                logger.warning(f"Could not fetch sailing averages: {e}")
+
+        # current = snapshot.get("current_state", {})
+        # sailing = snapshot.get("sailing_averages", {})
+
+        # lat = current.get("latitude")
+        # lon = current.get("longitude")
+
+        # if not lat or not lon:
+        #     raise HTTPException(status_code=500, detail="Vessel position unavailable")
 
         # --- Run JIT math ---
-        logger.info(f"JIT: Running calculation for {imo} → {port_name}")
+        # logger.info(f"JIT: Running calculation for {imo} → {port_name}")
+        # calc = run_jit_calculation(
+        #     imo=imo,
+        #     current_lat=lat,
+        #     current_lon=lon,
+        #     current_speed=current.get("sog_knots") or 0,
+        #     current_fuel=current.get("fuel_kgph"),
+        #     avg_speed=sailing.get("avg_sog_knots"),
+        #     avg_fuel=sailing.get("avg_fuel_kgph"),
+        #     destination_lat=port["lat"],
+        #     destination_lon=port["lon"],
+        #     etb_iso=etb_iso
+        # )
+        logger.info(f"JIT DEBUG - vessel: ({lat}, {lon}), port: ({port['lat']}, {port['lon']}), port_name: {port_name}")
         calc = run_jit_calculation(
             imo=imo,
-            current_lat=lat,
-            current_lon=lon,
-            current_speed=current.get("sog_knots") or 0,
-            current_fuel=current.get("fuel_kgph"),
-            avg_speed=sailing.get("avg_sog_knots"),
-            avg_fuel=sailing.get("avg_fuel_kgph"),
+            current_lat=float(lat),
+            current_lon=float(lon),
+            current_speed=float(sog) if sog else 0,
+            current_fuel=float(fuel) if fuel else None,
+            avg_speed=avg_speed,
+            avg_fuel=avg_fuel,
             destination_lat=port["lat"],
             destination_lon=port["lon"],
             etb_iso=etb_iso
@@ -1097,7 +1156,23 @@ async def jit_recommend(imo: str, request_data: Dict[str, Any]):
                 "generated_at":         calc["calculated_at"],
                 "status":               "PENDING"
             }
-            return JSONResponse(content={"data": card})    
+            return JSONResponse(content={"data": card})
+        if calc.get("recommendation") == "ERROR":
+            card = {
+                "card_type":            "JIT_ARRIVAL",
+                "vessel_imo":           imo,
+                "destination_port":     port_name,
+                "etb":                  etb_iso,
+                "recommendation":       "ERROR",
+                "distance_nm":          calc.get("distance_to_port_nm"),
+                "hours_until_etb":      calc.get("hours_until_etb"),
+                "berth_confidence_pct": 0,
+                "anchorage_risk_pct":   0,
+                "instruction_text":     calc["note"],
+                "generated_at":         calc["calculated_at"],
+                "status":               "ERROR"
+            }
+            return JSONResponse(content={"data": card})        
 
 
         # --- Generate instruction card via Qwen ---

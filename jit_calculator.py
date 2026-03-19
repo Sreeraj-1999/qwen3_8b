@@ -19,14 +19,14 @@ def get_vessel_config(imo):
         return configs.get(str(imo), {
             "fuel_price_usd_per_tonne": 600,
             "min_speed_knots": 8.0,
-            "max_speed_knots": 22.0,
+            "max_speed_knots": 28.0,
             "design_speed_knots": 14.0
         })
     except:
         return {
             "fuel_price_usd_per_tonne": 600,
             "min_speed_knots": 8.0,
-            "max_speed_knots": 22.0,
+            "max_speed_knots": 28.0,
             "design_speed_knots": 14.0
         }
 
@@ -118,11 +118,32 @@ def run_jit_calculation(
     now = datetime.now(timezone.utc)
     hours_until_etb = (etb - now).total_seconds() / 3600
 
+    # if hours_until_etb <= 0:
+    #     return {"error": "ETB is in the past"}
+
+    # if hours_until_etb < 1:
+    #     return {"error": "Less than 1 hour to ETB — too late for JIT adjustment"}
     if hours_until_etb <= 0:
-        return {"error": "ETB is in the past"}
+        return {
+            "recommendation": "ERROR",
+            "note": f"ETB {etb_iso} is in the past. Please provide a future ETB.",
+            "distance_to_port_nm": 0,
+            "hours_until_etb": round(hours_until_etb, 2),
+            "berth_confidence_pct": 0,
+            "anchorage_risk_pct": 0,
+            "calculated_at": now.isoformat()
+        }
 
     if hours_until_etb < 1:
-        return {"error": "Less than 1 hour to ETB — too late for JIT adjustment"}
+        return {
+            "recommendation": "ERROR",
+            "note": "Less than 1 hour to ETB. Too late for JIT speed adjustment. Proceed at current speed and coordinate with port agent.",
+            "distance_to_port_nm": 0,
+            "hours_until_etb": round(hours_until_etb, 2),
+            "berth_confidence_pct": 0,
+            "anchorage_risk_pct": 0,
+            "calculated_at": now.isoformat()
+        }
 
     # --- Distance to port ---
     distance_nm = calculate_distance_nm(
