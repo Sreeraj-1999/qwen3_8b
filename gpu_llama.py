@@ -16,11 +16,11 @@ import time
 
 from llama_cpp import Llama
 
-GGUF_MODEL_PATH = r"C:\Users\User\Desktop\siemens\PROJECT5D\test\qwen3_marine_Q4_K_M.gguf"
+GGUF_MODEL_PATH = r"C:\Users\User\Desktop\siemens\PROJECT5D\test\Qwen3.5-9B-Q4_K_M.gguf"
 
 llm = Llama(
     model_path=GGUF_MODEL_PATH,
-    n_ctx=16384,
+    n_ctx=32768,
     n_gpu_layers=99,
     main_gpu=0,
     cache_type_k="q4_0",
@@ -103,7 +103,9 @@ with suppress_stdout_stderr():
 # We still need the tokenizer for apply_chat_template (building prompts)
 from transformers import AutoTokenizer
 
-TOKENIZER_PATH = r"C:\Users\User\Desktop\siemens\OFFSHORE\qwen3_marine_final_v3"
+# TOKENIZER_PATH = r"C:\Users\User\Desktop\siemens\OFFSHORE\qwen3_marine_final_v3"
+TOKENIZER_PATH = r"C:\Users\User\Desktop\siemens\PROJECT5D\test\qwen35_tokenizer"
+
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH, trust_remote_code=True)
 tokenizer.eos_token = "<|im_end|>"
 tokenizer.pad_token = tokenizer.eos_token
@@ -189,7 +191,7 @@ def relative_wind_direction(wind_direction, ship_heading):
 # ==============================================================================
 # HELPER: Generate response from GGUF model
 # ==============================================================================
-def gguf_generate(prompt, max_tokens=1024, temperature=0.1, stop=None):
+def gguf_generate(prompt, max_tokens=4096, temperature=0.1, stop=None):
     """Generate text from GGUF model. Returns the generated text."""
     if stop is None:
         stop = ["<|im_end|>", "<|endoftext|>"]
@@ -206,7 +208,7 @@ def gguf_generate(prompt, max_tokens=1024, temperature=0.1, stop=None):
     return output["choices"][0]["text"]
 
 
-def gguf_stream(prompt, max_tokens=1024, temperature=0.1, stop=None):
+def gguf_stream(prompt, max_tokens=4096, temperature=0.1, stop=None):
     """Stream text from GGUF model. Yields chunks."""
     if stop is None:
         stop = ["<|im_end|>", "<|endoftext|>"]
@@ -312,7 +314,7 @@ def generate_llm_response():
         )
 
         # Generate with GGUF
-        max_tok = data.get('max_tokens', 1024)
+        max_tok = data.get('max_tokens', 4096)
         # response = gguf_generate(text, max_tokens=1024, temperature=0.1)
         response = gguf_generate(text, max_tokens=max_tok, temperature=0.1)
         if "<tool_call>" in response:
@@ -338,8 +340,8 @@ def generate_llm_response():
                     add_generation_prompt=True, enable_thinking=False
                 )
                 
-                text2 = truncate_prompt_to_fit(text2, max_gen_tokens=1024)
-                response = gguf_generate(text2, max_tokens=1024, temperature=0.1)
+                text2 = truncate_prompt_to_fit(text2, max_gen_tokens=4096)
+                response = gguf_generate(text2, max_tokens=4096, temperature=0.1)
 
         # Tool call loop (max 1 round)
         # if "<tool_call>" in response:
@@ -431,10 +433,24 @@ def stream_llm_response():
                 # Stream from GGUF
                 in_thinking = True
                 buffer = ""
+                think_token_count = 0
+                THINK_TOKEN_LIMIT = 500  # Force-close thinking after 500 tokens
 
-                for token in gguf_stream(text, max_tokens=1024, temperature=0.1):
+                for token in gguf_stream(text, max_tokens=4096, temperature=0.1):
                     buffer += token
-                    
+                    if in_thinking:
+                        think_token_count += 1
+
+                    # Force-close thinking if it exceeds budget
+                    if in_thinking and think_token_count >= THINK_TOKEN_LIMIT and "</think>" not in buffer:
+                        think_content = buffer.replace("<think>", "")
+                        if think_content:
+                            yield f"data: {json.dumps({'type': 'thinking', 'content': think_content})}\n\n"
+                        in_thinking = False
+                        buffer = ""
+                        # Inject </think> into the prompt to force the model to answer
+                        continue
+
                     # Process buffer for think/answer transitions
                     if in_thinking and "</think>" in buffer:
                         parts = buffer.split("</think>", 1)
@@ -458,8 +474,8 @@ def stream_llm_response():
                             if send:
                                 yield f"data: {json.dumps({'type': 'thinking', 'content': send})}\n\n"
                     else:
-                        # Answer mode — stream directly
-                        clean = buffer.replace("<|im_end|>", "").replace("<|im_start|>", "")
+                        # Answer mode — stream directly, strip any leaked think tags
+                        clean = buffer.replace("<|im_end|>", "").replace("<|im_start|>", "").replace("<think>", "").replace("</think>", "")
                         if clean:
                             yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
                         buffer = ""
@@ -514,10 +530,25 @@ def stream_chat_response():
         enable_thinking = False
         imo = data.get('imo')
         if imo and messages and messages[0].get('role') == 'system':
-            messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
-            Current year is 2026. When querying time ranges, use 2026.
-            When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
-            Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
+            messages[0]['content'] += f"""
+
+You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
+Current year is 2026. When querying time ranges, use 2026.
+
+THINKING RULES:
+- Keep your thinking brief and focused. Maximum 3-5 short bullet points in your thinking. Do not over-analyze simple questions.
+- For straightforward questions (positions, job lists, sensor readings), think in 1-2 lines then answer immediately.
+
+TOOL USAGE RULES:
+- You have access to tools for fetching LIVE vessel data (telemetry, position, alarms) and PMS data (maintenance jobs, spare parts, equipment, running hours).
+- ONLY call a tool when the user asks for REAL-TIME or DATABASE information that you cannot know from general knowledge.
+- Questions like "what jobs are pending", "where is the vessel", "what is the current RPM" → MUST call a tool. You do NOT have this data. NEVER fabricate live data.
+- Questions like "what causes high exhaust temperature", "explain scavenge fire procedure", "what is the load of a coffee percolator" → answer from your knowledge. Do NOT call any tool.
+- If you are unsure whether you need a tool, call the tool. It is better to call a tool unnecessarily than to fabricate data.
+- NEVER invent job IDs, sensor readings, positions, or maintenance records. If you don't call a tool, you don't have the data.
+
+When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
+Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
             # messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
             # Current year is 2026. When querying time ranges, use 2026.
             # Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
@@ -562,8 +593,6 @@ def stream_chat_response():
                         user_question = m['content']
                         break
                 
-                # likely_tool = bool(tools) and needs_tool_call(user_question)
-                # likely_tool = bool(tools) and needs_tool_call(user_question, imo)
                 likely_tool = bool(tools)
                 logger.info(f"DEBUG TOOL - user_question: '{user_question[:100]}', tools: {bool(tools)}, likely_tool: {likely_tool}")
                 
@@ -576,7 +605,7 @@ def stream_chat_response():
                         enable_thinking=enable_thinking,
                         tools=tools
                     )
-                    response = gguf_generate(text, max_tokens=1024, temperature=0.1)
+                    response = gguf_generate(text, max_tokens=4096, temperature=0.1)
 
                     if "<tool_call>" in response:
                         tool_name, tool_args = parse_tool_call(response)
@@ -608,9 +637,9 @@ def stream_chat_response():
                                 pass2_messages, tokenize=False,
                                 add_generation_prompt=True, enable_thinking=False
                             )
-                            text2 = truncate_prompt_to_fit(text2, max_gen_tokens=1024)
+                            text2 = truncate_prompt_to_fit(text2, max_gen_tokens=4096)
 
-                            for token in gguf_stream(text2, max_tokens=1024, temperature=0.1):
+                            for token in gguf_stream(text2, max_tokens=4096, temperature=0.1):
                                 clean = token.replace("<|im_end|>", "").replace("<|im_start|>", "")
                                 clean = clean.replace("<think>", "").replace("</think>", "")
                                 if clean:
@@ -644,7 +673,7 @@ def stream_chat_response():
                         enable_thinking=False  # No thinking for general chat
                     )
 
-                    for token in gguf_stream(text, max_tokens=1024, temperature=0.1):
+                    for token in gguf_stream(text, max_tokens=4096, temperature=0.1):
                         clean = token.replace("<|im_end|>", "").replace("<|im_start|>", "")
                         clean = clean.replace("<think>", "").replace("</think>", "")
                         if clean:

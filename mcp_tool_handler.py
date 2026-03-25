@@ -311,15 +311,38 @@ def execute_tool_call(tool_name: str, arguments: dict) -> str:
 
 
 def parse_tool_call(response_text: str):
-    """Parse <tool_call> from model response"""
+    """Parse <tool_call> from model response — supports both JSON and Qwen3.5 XML format"""
     if "<tool_call>" not in response_text:
         return None, None
-    
+
     try:
-        tool_json = response_text.split("<tool_call>")[1].split("</tool_call>")[0].strip()
-        parsed = json.loads(tool_json)
-        return parsed.get("name"), parsed.get("arguments", {})
-    except (json.JSONDecodeError, IndexError) as e:
+        tool_content = response_text.split("<tool_call>")[1].split("</tool_call>")[0].strip()
+
+        # Try JSON format first (Qwen3 style): {"name": "...", "arguments": {...}}
+        try:
+            parsed = json.loads(tool_content)
+            return parsed.get("name"), parsed.get("arguments", {})
+        except json.JSONDecodeError:
+            pass
+
+        # Try XML format (Qwen3.5 style): <function=name><parameter=key>value</parameter></function>
+        import re
+        func_match = re.search(r'<function=(\w+)>', tool_content)
+        if func_match:
+            func_name = func_match.group(1)
+            params = {}
+            param_matches = re.findall(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', tool_content, re.DOTALL)
+            for param_name, param_value in param_matches:
+                # Try to parse as int/float/json, otherwise keep as string
+                param_value = param_value.strip()
+                try:
+                    params[param_name] = json.loads(param_value)
+                except (json.JSONDecodeError, ValueError):
+                    params[param_name] = param_value
+            return func_name, params
+
+        return None, None
+    except (IndexError) as e:
         logger.error(f"Failed to parse tool call: {e}")
         return None, None
 
@@ -337,11 +360,12 @@ def needs_tool_call(question: str, imo: str = None) -> bool:
         "position", "latitude", "longitude", "heading", "sog", "stw",
         "wind", "weather", "turbocharger rpm", "tc rpm",
         "anchored", "at sea", "sailing", "underway",
+        "where is", "where are", "location", "vessel position", "current position",
     ]
     
     pms_keywords = [
-        "maintenance", "job plan", "pending job", "overdue", "due job",
-        "completed job", "job history", "job report", "inspection",
+        "maintenance", "job plan", "pending job", "pending", "overdue", "due job", "due",
+        "completed job", "job history", "job report", "inspection", "jobs",
         "spare part", "spares", "stock", "rob", "reorder", "inventory",
         "running hour", "counter reading", "equipment list", "maker",
         "serial number", "pms", "planned maintenance",
