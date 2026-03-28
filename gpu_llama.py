@@ -219,6 +219,7 @@ def gguf_generate(prompt, max_tokens=4096, temperature=0.7, stop=None,
         "presence_penalty": presence_penalty,
         "stop": stop,
         "stream": False,
+        "cache_prompt": True,
     }, timeout=300)
     resp.raise_for_status()
     return resp.json()["content"]
@@ -240,6 +241,7 @@ def gguf_stream(prompt, max_tokens=4096, temperature=0.7, stop=None,
         "presence_penalty": presence_penalty,
         "stop": stop,
         "stream": True,
+        "cache_prompt": True,
     }, stream=True, timeout=300)
     resp.raise_for_status()
 
@@ -434,80 +436,75 @@ def stream_llm_response():
                 logger.info(f"=== STREAM: {len(final_messages)} msgs, history={len(history_msgs)} msgs ===")
 
                 # ============================================================
-                # Use /completion with tokenizer — enable_thinking=True
-                # Real-time streaming: thinking tokens → thinking box,
-                # after </think> → answer box
-                # Qwen3.5 official params: temp=1.0, top_p=0.95 for thinking
+                # Use /v1/chat/completions — server handles reasoning budget
+                # --reasoning-budget 1024 caps thinking tokens
+                # --reasoning-format deepseek splits into reasoning_content/content
                 # ============================================================
                 stream_start_time = time.time()
 
-                text = tokenizer.apply_chat_template(
-                    final_messages, tokenize=False,
-                    add_generation_prompt=True,
-                    enable_thinking=True
-                )
+                logger.info(f"=== STREAM: sending to /v1/chat/completions, {len(final_messages)} msgs ===")
 
-                logger.info(f"=== STREAM PROMPT (last 200): {repr(text[-200:])} ===")
+                # Send immediate feedback
+                yield f"data: {json.dumps({'type': 'thinking', 'content': 'Analyzing...'})}\n\n"
 
-                # Real-time stream with state tracking
-                in_thinking = True  # Model starts in thinking mode after <think>
+                resp = http_requests.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json={
+                    'model': 'qwen3.5-9b',
+                    'messages': final_messages,
+                    'max_tokens': 4096,
+                    'temperature': 0.6,
+                    'top_p': 0.95,
+                    'top_k': 20,
+                    'presence_penalty': 1.5,
+                    'stream': True,
+                }, stream=True, timeout=300)
+                resp.raise_for_status()
+
                 thinking_buf = ""
                 answer_buf = ""
-                raw_buf = ""         # For detecting </think> boundary
 
-                for token in gguf_stream(text, max_tokens=4096, temperature=1.0,
-                                          top_p=0.95, top_k=20, presence_penalty=1.5):
-                    raw_buf += token
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    line_str = line.decode('utf-8')
+                    if not line_str.startswith('data: '):
+                        continue
+                    payload = line_str[6:]
+                    if payload.strip() == '[DONE]':
+                        break
 
-                    if in_thinking:
-                        # Check if </think> appeared
-                        if '</think>' in raw_buf:
-                            # Split at </think>
-                            parts = raw_buf.split('</think>', 1)
-                            # Send remaining thinking content
-                            think_text = parts[0].replace('<think>', '')
-                            if think_text:
-                                thinking_buf += think_text
-                                yield f"data: {json.dumps({'type': 'thinking', 'content': think_text})}\n\n"
-                            # Switch to answer mode
-                            in_thinking = False
-                            raw_buf = parts[1]  # Leftover after </think>
-                            if raw_buf.strip():
-                                clean = raw_buf.replace('<|im_end|>', '').replace('<|im_start|>', '')
-                                if clean.strip():
-                                    answer_buf += clean
-                                    yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
-                            raw_buf = ""
-                        else:
-                            # Still thinking — stream tokens to thinking box
-                            # But buffer a bit to avoid sending partial </think>
-                            safe_len = len(raw_buf) - 8  # Keep last 8 chars as buffer
-                            if safe_len > 0:
-                                to_send = raw_buf[:safe_len].replace('<think>', '')
-                                raw_buf = raw_buf[safe_len:]
-                                if to_send:
-                                    thinking_buf += to_send
-                                    # Cap thinking display at 3000 chars
-                                    if len(thinking_buf) <= 3000:
-                                        yield f"data: {json.dumps({'type': 'thinking', 'content': to_send})}\n\n"
-                    else:
-                        # In answer mode — stream directly
-                        clean = token.replace('<|im_end|>', '').replace('<|im_start|>', '')
-                        clean = clean.replace('<think>', '').replace('</think>', '')
-                        if clean:
-                            answer_buf += clean
-                            yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+                    try:
+                        chunk = json.loads(payload)
+                        delta = chunk.get('choices', [{}])[0].get('delta', {})
 
-                # Flush remaining buffer
-                if in_thinking and raw_buf:
-                    # Never got </think> — model used all tokens on thinking
-                    think_text = raw_buf.replace('<think>', '').replace('</think>', '')
-                    thinking_buf += think_text
-                    if think_text.strip() and len(thinking_buf) <= 3000:
-                        yield f"data: {json.dumps({'type': 'thinking', 'content': think_text})}\n\n"
+                        # Thinking tokens (reasoning_content)
+                        think_token = delta.get('reasoning_content', '')
+                        if think_token:
+                            thinking_buf += think_token
+                            # Stream thinking in real-time, cap display at 3000 chars
+                            if len(thinking_buf) <= 3000:
+                                yield f"data: {json.dumps({'type': 'thinking', 'content': think_token})}\n\n"
+
+                        # Answer tokens (content)
+                        answer_token = delta.get('content', '')
+                        if answer_token:
+                            clean = answer_token.replace('<|im_end|>', '').replace('<|im_start|>', '')
+                            if clean:
+                                answer_buf += clean
+                                yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+
+                    except json.JSONDecodeError:
+                        continue
 
                 elapsed = time.time() - stream_start_time
                 logger.info(f"=== STREAM DONE: thinking={len(thinking_buf)} chars, answer={len(answer_buf)} chars, time={elapsed:.1f}s ===")
+
+                # Fallback: if answer empty but thinking has content after </think>
+                if not answer_buf.strip() and thinking_buf:
+                    if '</think>' in thinking_buf:
+                        fallback = thinking_buf.split('</think>')[-1].strip()
+                        if fallback:
+                            answer_buf = fallback
+                            yield f"data: {json.dumps({'type': 'answer', 'content': fallback})}\n\n"
 
                 if not answer_buf.strip():
                     logger.warning(f"=== STREAM: No answer produced ===")
