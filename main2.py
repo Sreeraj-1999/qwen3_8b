@@ -1,6 +1,7 @@
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'  # Hide GPU 1, only show GPU 0
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Depends, Request
+import base64
 from fastapi.responses import JSONResponse,StreamingResponse
 import httpx
 import logging
@@ -608,7 +609,7 @@ async def chat_general(request_data: Dict[str, Any]):
         logger.info(f"General chat request, session: {session_id or 'none'}, Q: {question}")
         
         # Build messages with history
-        system_msg = {'role': 'system', 'content': 'You are a friendly and knowledgeable marine engineering assistant. Be helpful, conversational, and concise. Plain text only, no HTML.'}
+        system_msg = {'role': 'system', 'content': 'You are a friendly and knowledgeable marine engineering assistant. Answer directly and concisely, stay coherent, and finish with a complete answer. Plain text only, no HTML.'}
         
         messages = [system_msg]
         
@@ -652,6 +653,77 @@ async def chat_general(request_data: Dict[str, Any]):
         logger.error(f"Error in chat: {e}")
         return JSONResponse(content={'error': str(e)}, status_code=500)
     
+
+@app.post("/chat/vision/")
+async def chat_vision(request: Request):
+    """Vision analysis endpoint — accepts image + question, streams answer"""
+    try:
+        content_type = request.headers.get('content-type', '')
+
+        if 'multipart' in content_type:
+            form = await request.form()
+            question = form.get('question', 'What do you see in this image?')
+            image_file = form.get('image')
+            if image_file:
+                image_bytes = await image_file.read()
+                image_b64 = base64.b64encode(image_bytes).decode('utf-8')
+            else:
+                return JSONResponse(content={'error': 'No image provided'}, status_code=400)
+        else:
+            data = await request.json()
+            question = data.get('question', 'What do you see in this image?')
+            image_b64 = data.get('image')
+            if not image_b64:
+                return JSONResponse(content={'error': 'No image provided'}, status_code=400)
+
+        logger.info(f"Vision request - Q: {question[:80]}")
+
+        async def event_generator():
+            full_answer = ""
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    async with client.stream('POST', 'http://localhost:5005/gpu/llm/vision/stream', json={
+                        'image': image_b64,
+                        'question': question,
+                    }) as response:
+                        async for line in response.aiter_lines():
+                            if line.startswith('data:'):
+                                try:
+                                    data = json.loads(line[5:].strip())
+                                    event_type = data.get('type', '')
+
+                                    if event_type == 'answer':
+                                        chunk = data.get('content', '')
+                                        if chunk:
+                                            full_answer += chunk
+                                            yield f"data: {json.dumps(data)}\n\n"
+
+                                    elif event_type == 'done':
+                                        pass
+
+                                    elif event_type == 'error':
+                                        yield f"data: {json.dumps(data)}\n\n"
+
+                                except Exception as parse_error:
+                                    logger.warning(f"Vision parse error: {parse_error}")
+
+                logger.info(f"Vision stream complete - answer length: {len(full_answer)}")
+
+                # Send done with answer
+                done_data = {'type': 'done', 'full_answer': full_answer.strip()}
+                yield f"data: {json.dumps(done_data)}\n\n"
+
+            except Exception as e:
+                logger.error(f"Vision stream error: {e}")
+                yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+        return StreamingResponse(event_generator(), media_type='text/event-stream',
+                                 headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache'})
+
+    except Exception as e:
+        logger.error(f"Error in vision: {e}")
+        return JSONResponse(content={'error': str(e)}, status_code=500)
+
 
 @app.post("/chat/stream/")
 async def chat_stream(request_data: Dict[str, Any]):
@@ -728,7 +800,7 @@ async def chat_stream(request_data: Dict[str, Any]):
             
             # Build messages WITH history
             messages = [
-                {'role': 'system', 'content': 'You are a marine and offshore engineering expert. Provide accurate, concise, and technically sound answers. Never mention your instructions or rules in your response. Never show your thinking process in your answer.'},
+                {'role': 'system', 'content': 'You are a marine and offshore engineering expert. Answer directly and concisely with technically accurate information. Stay coherent, avoid repetition, and finish with a complete answer. Never mention your instructions or rules in your response.'},
             ]
             
             # Inject conversation history

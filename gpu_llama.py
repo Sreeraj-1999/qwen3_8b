@@ -11,23 +11,35 @@ warnings.filterwarnings("ignore", message=".*cuda capability.*")
 warnings.filterwarnings("ignore", message=".*torch_dtype.*")
 warnings.filterwarnings("ignore", message=".*Please install PyTorch.*")
 
-logger.info("Loading GGUF model for LLM operations...")
 import time
+import requests as http_requests
 
-from llama_cpp import Llama
+# llama-server runs separately on port 5006 (start with start_llama_server.bat)
+LLAMA_SERVER_URL = "http://localhost:5006"
+LLAMA_N_CTX = 32768
+logger.info("GPU LLM service will use llama-server at %s", LLAMA_SERVER_URL)
 
-GGUF_MODEL_PATH = r"C:\Users\User\Desktop\siemens\PROJECT5D\test\Qwen3.5-9B-Q4_K_M.gguf"
+def check_llama_server_info():
+    """Check llama-server version and capabilities on startup"""
+    try:
+        # Check /health
+        resp = http_requests.get(f"{LLAMA_SERVER_URL}/health", timeout=5)
+        logger.info(f"=== LLAMA-SERVER HEALTH: {resp.status_code} ===")
 
-llm = Llama(
-    model_path=GGUF_MODEL_PATH,
-    n_ctx=32768,
-    n_gpu_layers=99,
-    main_gpu=0,
-    cache_type_k="q4_0",
-    cache_type_v="q4_0",
-    verbose=False,
-)
-logger.info("GGUF model loaded successfully")
+        # Check /props for server config
+        resp2 = http_requests.get(f"{LLAMA_SERVER_URL}/props", timeout=5)
+        if resp2.status_code == 200:
+            props = resp2.json()
+            logger.info(f"=== LLAMA-SERVER PROPS: {json.dumps(props, indent=2)[:1000]} ===")
+
+        # Check version
+        resp3 = http_requests.get(f"{LLAMA_SERVER_URL}/v1/models", timeout=5)
+        if resp3.status_code == 200:
+            models = resp3.json()
+            logger.info(f"=== LLAMA-SERVER MODELS: {json.dumps(models)[:500]} ===")
+
+    except Exception as e:
+        logger.warning(f"Could not reach llama-server at startup: {e} (start it with start_llama_server.bat)")
 
 # Clear comtypes cache BEFORE importing comtypes
 import shutil
@@ -191,62 +203,74 @@ def relative_wind_direction(wind_direction, ship_heading):
 # ==============================================================================
 # HELPER: Generate response from GGUF model
 # ==============================================================================
-def gguf_generate(prompt, max_tokens=4096, temperature=0.1, stop=None):
-    """Generate text from GGUF model. Returns the generated text."""
+def gguf_generate(prompt, max_tokens=4096, temperature=0.7, stop=None,
+                   top_p=0.8, top_k=20, presence_penalty=1.5, repeat_penalty=1.0):
+    """Generate text via llama-server /completion endpoint. Returns the generated text."""
     if stop is None:
         stop = ["<|im_end|>", "<|endoftext|>"]
-    
-    output = llm(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=0.8,
-        top_k=20,
-        repeat_penalty=1.2,
-        stop=stop,
-    )
-    return output["choices"][0]["text"]
+
+    resp = http_requests.post(f"{LLAMA_SERVER_URL}/completion", json={
+        "prompt": prompt,
+        "n_predict": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "repeat_penalty": repeat_penalty,
+        "presence_penalty": presence_penalty,
+        "stop": stop,
+        "stream": False,
+    }, timeout=300)
+    resp.raise_for_status()
+    return resp.json()["content"]
 
 
-def gguf_stream(prompt, max_tokens=4096, temperature=0.1, stop=None):
-    """Stream text from GGUF model. Yields chunks."""
+def gguf_stream(prompt, max_tokens=4096, temperature=0.7, stop=None,
+                 top_p=0.8, top_k=20, presence_penalty=1.5, repeat_penalty=1.0):
+    """Stream text via llama-server /completion endpoint. Yields chunks."""
     if stop is None:
         stop = ["<|im_end|>", "<|endoftext|>"]
-    
-    stream = llm(
-        prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=0.95,
-        top_k=20,
-        repeat_penalty=1.2,
-        stop=stop,
-        stream=True,
-    )
-    for chunk in stream:
-        token = chunk["choices"][0]["text"]
-        if token:
-            yield token
+
+    resp = http_requests.post(f"{LLAMA_SERVER_URL}/completion", json={
+        "prompt": prompt,
+        "n_predict": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
+        "repeat_penalty": repeat_penalty,
+        "presence_penalty": presence_penalty,
+        "stop": stop,
+        "stream": True,
+    }, stream=True, timeout=300)
+    resp.raise_for_status()
+
+    for line in resp.iter_lines():
+        if line:
+            line_str = line.decode("utf-8")
+            if line_str.startswith("data: "):
+                data = json.loads(line_str[6:])
+                if not data.get("stop", False):
+                    token = data.get("content", "")
+                    if token:
+                        yield token
 
 def truncate_prompt_to_fit(prompt, max_gen_tokens=1024):
     """Trim ONLY conversation history if prompt too long. NEVER touches tool results."""
-    n_ctx = llm.n_ctx()
-    prompt_tokens = len(llm.tokenize(prompt.encode("utf-8")))
-    max_prompt_tokens = n_ctx - max_gen_tokens
-    
+    prompt_tokens = len(tokenizer.encode(prompt))
+    max_prompt_tokens = LLAMA_N_CTX - max_gen_tokens
+
     if prompt_tokens <= max_prompt_tokens:
         return prompt
-    
+
     logger.warning(f"Prompt {prompt_tokens} tokens, limit {max_prompt_tokens}. Trimming history.")
-    
+
     history_start = prompt.find("=== CONVERSATION HISTORY")
     history_end = prompt.find("=== END HISTORY ===")
-    
+
     if history_start != -1 and history_end != -1:
         trimmed = prompt[:history_start] + prompt[history_end + len("=== END HISTORY ==="):]
-        logger.info(f"Removed history. Now {len(llm.tokenize(trimmed.encode('utf-8')))} tokens.")
+        logger.info(f"Removed history. Now {len(tokenizer.encode(trimmed))} tokens.")
         return trimmed
-    
+
     return prompt
 
 
@@ -305,18 +329,20 @@ def generate_llm_response():
         
         logger.info(f"=== PROMPT: {len(messages)} msgs, tools={'yes' if tools else 'no'}, history={len(history_msgs)} msgs ===")
 
-        # Build prompt using tokenizer's chat template
+        # Build prompt using tokenizer's chat template — always disable thinking
         text = tokenizer.apply_chat_template(
             messages, tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=enable_thinking,
+            enable_thinking=False,
             tools=tools
         )
+        # Strip <think> tags — model generates "/" when it sees them
+        text = text.replace('<think>\n\n</think>\n\n', '')
+        text = text.replace('<think>', '').replace('</think>', '')
 
-        # Generate with GGUF
         max_tok = data.get('max_tokens', 4096)
-        # response = gguf_generate(text, max_tokens=1024, temperature=0.1)
-        response = gguf_generate(text, max_tokens=max_tok, temperature=0.1)
+        gen_temp = 0.7
+        response = gguf_generate(text, max_tokens=max_tok, temperature=gen_temp)
         if "<tool_call>" in response:
             tool_name, tool_args = parse_tool_call(response)
             if tool_name:
@@ -339,9 +365,10 @@ def generate_llm_response():
                     messages, tokenize=False,
                     add_generation_prompt=True, enable_thinking=False
                 )
-                
+                text2 = text2.replace('<think>\n\n</think>\n\n', '')
+                text2 = text2.replace('<think>', '').replace('</think>', '')
                 text2 = truncate_prompt_to_fit(text2, max_gen_tokens=4096)
-                response = gguf_generate(text2, max_tokens=4096, temperature=0.1)
+                response = gguf_generate(text2, max_tokens=4096, temperature=0.7)
 
         # Tool call loop (max 1 round)
         # if "<tool_call>" in response:
@@ -366,7 +393,7 @@ def generate_llm_response():
         #             add_generation_prompt=True, enable_thinking=False
         #         )
 
-        #         response = gguf_generate(text2, max_tokens=1024, temperature=0.1)
+        #         response = gguf_generate(text2, max_tokens=1024, temperature=0.7)
 
         # Clean
         if "</think>" in response:
@@ -384,21 +411,21 @@ def generate_llm_response():
 
 @app.route('/gpu/llm/stream', methods=['POST'])
 def stream_llm_response():
-    """Stream LLM response with thinking and answer separated"""
+    """Stream LLM response via /v1/chat/completions — server handles reasoning budget"""
     try:
         data = request.get_json()
         messages = data.get('messages', [])
-        
+
         if not messages:
             return jsonify({'error': 'No messages provided'}), 400
-        
+
         def generate():
             try:
-                # --- Same history handling as /generate ---
+                # --- History handling ---
                 system_msg = None
                 history_msgs = []
                 current_user_msg = None
-                
+
                 for m in messages:
                     if m['role'] == 'system' and system_msg is None:
                         system_msg = m
@@ -406,7 +433,7 @@ def stream_llm_response():
                         current_user_msg = m
                     else:
                         history_msgs.append(m)
-                
+
                 if history_msgs and system_msg:
                     history_text = "\n\n=== CONVERSATION HISTORY (use this for follow-up questions) ===\n"
                     for h in history_msgs:
@@ -415,89 +442,104 @@ def stream_llm_response():
                         history_text += f"{role_label}: {content}\n"
                     history_text += "=== END HISTORY ===\n"
                     system_msg['content'] += history_text
-                    
+
                     final_messages = [system_msg, current_user_msg]
                 else:
                     final_messages = messages
-                
-                logger.info(f"=== STREAM PROMPT: {len(final_messages)} msgs, history={len(history_msgs)} msgs ===")
 
-                # Build prompt with thinking enabled
+                logger.info(f"=== STREAM: {len(final_messages)} msgs, history={len(history_msgs)} msgs ===")
+
+                # ============================================================
+                # Use /completion with tokenizer — enable_thinking=True
+                # Real-time streaming: thinking tokens → thinking box,
+                # after </think> → answer box
+                # Qwen3.5 official params: temp=1.0, top_p=0.95 for thinking
+                # ============================================================
+                stream_start_time = time.time()
+
                 text = tokenizer.apply_chat_template(
-                    final_messages,
-                    tokenize=False,
+                    final_messages, tokenize=False,
                     add_generation_prompt=True,
                     enable_thinking=True
                 )
 
-                # Stream from GGUF
-                in_thinking = True
-                buffer = ""
-                think_token_count = 0
-                THINK_TOKEN_LIMIT = 500  # Force-close thinking after 500 tokens
+                logger.info(f"=== STREAM PROMPT (last 200): {repr(text[-200:])} ===")
 
-                for token in gguf_stream(text, max_tokens=4096, temperature=0.1):
-                    buffer += token
+                # Real-time stream with state tracking
+                in_thinking = True  # Model starts in thinking mode after <think>
+                thinking_buf = ""
+                answer_buf = ""
+                raw_buf = ""         # For detecting </think> boundary
+
+                for token in gguf_stream(text, max_tokens=4096, temperature=1.0,
+                                          top_p=0.95, top_k=20, presence_penalty=1.5):
+                    raw_buf += token
+
                     if in_thinking:
-                        think_token_count += 1
-
-                    # Force-close thinking if it exceeds budget
-                    if in_thinking and think_token_count >= THINK_TOKEN_LIMIT and "</think>" not in buffer:
-                        think_content = buffer.replace("<think>", "")
-                        if think_content:
-                            yield f"data: {json.dumps({'type': 'thinking', 'content': think_content})}\n\n"
-                        in_thinking = False
-                        buffer = ""
-                        # Inject </think> into the prompt to force the model to answer
-                        continue
-
-                    # Process buffer for think/answer transitions
-                    if in_thinking and "</think>" in buffer:
-                        parts = buffer.split("</think>", 1)
-                        # Send remaining thinking content
-                        think_content = parts[0].replace("<think>", "")
-                        if think_content:
-                            yield f"data: {json.dumps({'type': 'thinking', 'content': think_content})}\n\n"
-                        in_thinking = False
-                        buffer = parts[1] if len(parts) > 1 else ""
-                        # Send any answer content after </think>
-                        if buffer:
-                            yield f"data: {json.dumps({'type': 'answer', 'content': buffer})}\n\n"
-                            buffer = ""
-                    elif in_thinking:
-                        # Stream thinking tokens (but wait for enough to avoid partial tags)
-                        safe = buffer.replace("<think>", "")
-                        # Keep last 10 chars in buffer in case </think> is split across tokens
-                        if len(safe) > 10:
-                            send = safe[:-10]
-                            buffer = "<think>" + safe[-10:] if "<think>" in buffer else safe[-10:]
-                            if send:
-                                yield f"data: {json.dumps({'type': 'thinking', 'content': send})}\n\n"
+                        # Check if </think> appeared
+                        if '</think>' in raw_buf:
+                            # Split at </think>
+                            parts = raw_buf.split('</think>', 1)
+                            # Send remaining thinking content
+                            think_text = parts[0].replace('<think>', '')
+                            if think_text:
+                                thinking_buf += think_text
+                                yield f"data: {json.dumps({'type': 'thinking', 'content': think_text})}\n\n"
+                            # Switch to answer mode
+                            in_thinking = False
+                            raw_buf = parts[1]  # Leftover after </think>
+                            if raw_buf.strip():
+                                clean = raw_buf.replace('<|im_end|>', '').replace('<|im_start|>', '')
+                                if clean.strip():
+                                    answer_buf += clean
+                                    yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+                            raw_buf = ""
+                        else:
+                            # Still thinking — stream tokens to thinking box
+                            # But buffer a bit to avoid sending partial </think>
+                            safe_len = len(raw_buf) - 8  # Keep last 8 chars as buffer
+                            if safe_len > 0:
+                                to_send = raw_buf[:safe_len].replace('<think>', '')
+                                raw_buf = raw_buf[safe_len:]
+                                if to_send:
+                                    thinking_buf += to_send
+                                    # Cap thinking display at 3000 chars
+                                    if len(thinking_buf) <= 3000:
+                                        yield f"data: {json.dumps({'type': 'thinking', 'content': to_send})}\n\n"
                     else:
-                        # Answer mode — stream directly, strip any leaked think tags
-                        clean = buffer.replace("<|im_end|>", "").replace("<|im_start|>", "").replace("<think>", "").replace("</think>", "")
+                        # In answer mode — stream directly
+                        clean = token.replace('<|im_end|>', '').replace('<|im_start|>', '')
+                        clean = clean.replace('<think>', '').replace('</think>', '')
                         if clean:
+                            answer_buf += clean
                             yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
-                        buffer = ""
-                
+
                 # Flush remaining buffer
-                if buffer:
-                    clean = buffer.replace("<think>", "").replace("</think>", "").replace("<|im_end|>", "").replace("<|im_start|>", "")
-                    if clean.strip():
-                        msg_type = 'thinking' if in_thinking else 'answer'
-                        yield f"data: {json.dumps({'type': msg_type, 'content': clean})}\n\n"
+                if in_thinking and raw_buf:
+                    # Never got </think> — model used all tokens on thinking
+                    think_text = raw_buf.replace('<think>', '').replace('</think>', '')
+                    thinking_buf += think_text
+                    if think_text.strip() and len(thinking_buf) <= 3000:
+                        yield f"data: {json.dumps({'type': 'thinking', 'content': think_text})}\n\n"
+
+                elapsed = time.time() - stream_start_time
+                logger.info(f"=== STREAM DONE: thinking={len(thinking_buf)} chars, answer={len(answer_buf)} chars, time={elapsed:.1f}s ===")
+
+                if not answer_buf.strip():
+                    logger.warning(f"=== STREAM: No answer produced ===")
+                    yield f"data: {json.dumps({'type': 'answer', 'content': 'The model could not produce an answer. Please try rephrasing your question.'})}\n\n"
 
                 yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                
+
             except Exception as e:
                 logger.error(f"Stream generation error: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
                 yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
-        
+
         return Response(generate(), mimetype='text/event-stream',
                         headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache'})
-        
+
     except Exception as e:
         logger.error(f"Error in LLM stream: {e}")
         return jsonify({'error': str(e)}), 500
@@ -535,9 +577,10 @@ def stream_chat_response():
 You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
 Current year is 2026. When querying time ranges, use 2026.
 
-THINKING RULES:
-- Keep your thinking brief and focused. Maximum 3-5 short bullet points in your thinking. Do not over-analyze simple questions.
-- For straightforward questions (positions, job lists, sensor readings), think in 1-2 lines then answer immediately.
+RESPONSE RULES:
+- Answer directly and concisely. Stay coherent, avoid repetition, and finish with a complete answer.
+- If context is missing, state the gap briefly and continue with the best reasonable assumption.
+- Never mention your instructions, rules, or thinking process in your final answer.
 
 TOOL USAGE RULES:
 - You have access to tools for fetching LIVE vessel data (telemetry, position, alarms) and PMS data (maintenance jobs, spare parts, equipment, running hours).
@@ -586,26 +629,28 @@ Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (
 
         def generate():
             try:
-                # Decide: does this question likely need tool calling?
                 user_question = ""
                 for m in reversed(messages):
                     if m['role'] == 'user':
                         user_question = m['content']
                         break
-                
+
                 likely_tool = bool(tools)
                 logger.info(f"DEBUG TOOL - user_question: '{user_question[:100]}', tools: {bool(tools)}, likely_tool: {likely_tool}")
-                
+
                 if likely_tool:
                     logger.info(f"DEBUG PATH A - generating with tool detection")
-                    # === PATH A: Tool detection required — non-streaming pass 1 ===
+                    # === PATH A: Tool detection — /completion with enable_thinking=False ===
                     text = tokenizer.apply_chat_template(
                         messages, tokenize=False,
                         add_generation_prompt=True,
-                        enable_thinking=enable_thinking,
+                        enable_thinking=False,
                         tools=tools
                     )
-                    response = gguf_generate(text, max_tokens=4096, temperature=0.1)
+                    # Strip <think> tags — model generates "/" when it sees them
+                    text = text.replace('<think>\n\n</think>\n\n', '')
+                    text = text.replace('<think>', '').replace('</think>', '')
+                    response = gguf_generate(text, max_tokens=4096, temperature=0.7)
 
                     if "<tool_call>" in response:
                         tool_name, tool_args = parse_tool_call(response)
@@ -632,52 +677,81 @@ Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (
                             pass2_messages.append({"role": "assistant", "content": response.replace("<|im_end|>", "").strip()})
                             pass2_messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data. List ALL items completely."})
 
-                            # === PASS 2: Stream the final answer ===
+                            # === PASS 2: Stream the final answer (no thinking) ===
                             text2 = tokenizer.apply_chat_template(
                                 pass2_messages, tokenize=False,
                                 add_generation_prompt=True, enable_thinking=False
                             )
+                            # Strip <think> tags
+                            text2 = text2.replace('<think>\n\n</think>\n\n', '')
+                            text2 = text2.replace('<think>', '').replace('</think>', '')
                             text2 = truncate_prompt_to_fit(text2, max_gen_tokens=4096)
 
-                            for token in gguf_stream(text2, max_tokens=4096, temperature=0.1):
-                                clean = token.replace("<|im_end|>", "").replace("<|im_start|>", "")
-                                clean = clean.replace("<think>", "").replace("</think>", "")
-                                if clean:
-                                    yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+                            # Collect then send — strips all think tags reliably
+                            pass2_buffer = ""
+                            for token in gguf_stream(text2, max_tokens=4096, temperature=0.7):
+                                pass2_buffer += token
+
+                            # Strip any thinking that leaked despite enable_thinking=False
+                            if "</think>" in pass2_buffer:
+                                pass2_buffer = pass2_buffer.split("</think>")[-1]
+                            pass2_buffer = pass2_buffer.replace("<think>", "").replace("</think>", "")
+                            pass2_buffer = pass2_buffer.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+
+                            # Stream cleaned answer in chunks
+                            chunk_size = 6
+                            for i in range(0, len(pass2_buffer), chunk_size):
+                                chunk = pass2_buffer[i:i + chunk_size]
+                                if chunk:
+                                    yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
+                                    time.sleep(0.02)
 
                             yield f"data: {json.dumps({'type': 'done'})}\n\n"
                             return
-                    
+
                     # Tool was expected but model didn't call one — send response as stream
                     if "</think>" in response:
                         response = response.split("</think>")[-1]
+                    response = response.replace("<think>", "").replace("</think>", "")
                     response = response.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
-                    
+
                     # Send in reasonable chunks
-                    chunk_size = 6   #was 4
+                    chunk_size = 6
                     for i in range(0, len(response), chunk_size):
                         chunk = response[i:i + chunk_size]
                         if chunk:
                             yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
                             time.sleep(0.03)
 
-                    
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                
+
                 else:
                     logger.info(f"DEBUG PATH B - direct streaming, no tools")
-                    # === PATH B: No tools needed — REAL streaming directly ===
+                    # === PATH B: No tools — collect + strip thinking ===
                     text = tokenizer.apply_chat_template(
                         messages, tokenize=False,
                         add_generation_prompt=True,
-                        enable_thinking=False  # No thinking for general chat
+                        enable_thinking=False
                     )
+                    # Strip <think> tags
+                    text = text.replace('<think>\n\n</think>\n\n', '')
+                    text = text.replace('<think>', '').replace('</think>', '')
 
-                    for token in gguf_stream(text, max_tokens=4096, temperature=0.1):
-                        clean = token.replace("<|im_end|>", "").replace("<|im_start|>", "")
-                        clean = clean.replace("<think>", "").replace("</think>", "")
-                        if clean:
-                            yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+                    pathb_buffer = ""
+                    for token in gguf_stream(text, max_tokens=4096, temperature=0.7):
+                        pathb_buffer += token
+
+                    if "</think>" in pathb_buffer:
+                        pathb_buffer = pathb_buffer.split("</think>")[-1]
+                    pathb_buffer = pathb_buffer.replace("<think>", "").replace("</think>", "")
+                    pathb_buffer = pathb_buffer.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+
+                    chunk_size = 6
+                    for i in range(0, len(pathb_buffer), chunk_size):
+                        chunk = pathb_buffer[i:i + chunk_size]
+                        if chunk:
+                            yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
+                            time.sleep(0.02)
 
                     yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
@@ -693,6 +767,211 @@ Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (
     except Exception as e:
         logger.error(f"Error in stream-chat: {e}")
         return jsonify({'error': str(e)}), 500
+
+@app.route('/gpu/llm/vision', methods=['POST'])
+def vision_query():
+    """Analyze an image using Qwen3.5 vision via llama-server"""
+    try:
+        data = request.get_json()
+        image_b64 = data.get('image')  # base64 encoded image
+        question = data.get('question', 'What do you see in this image?')
+        max_tokens = data.get('max_tokens', 4096)
+
+        if not image_b64:
+            return jsonify({'error': 'No image provided (base64)'}), 400
+
+        logger.info(f"Vision query: {question[:80]}")
+
+        # Call llama-server's OpenAI-compatible vision endpoint
+        resp = http_requests.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json={
+            'model': 'qwen3.5-9b',
+            'messages': [
+                {
+                    'role': 'system',
+                    'content': 'You are a marine engineering diagram analyst. Study the image carefully. Give a direct, specific answer in 1-4 sentences. No preamble, no over-explanation.'
+                },
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_b64}'}},
+                        {'type': 'text', 'text': question}
+                    ]
+                }
+            ],
+            'max_tokens': max_tokens,
+            'temperature': 0.6,
+            'top_p': 0.8,
+            'top_k': 20,
+            'presence_penalty': 1.5,
+            'repeat_penalty': 1.0,
+        }, timeout=300)
+        resp.raise_for_status()
+
+        result = resp.json()
+        msg = result['choices'][0]['message']
+        content_text = msg.get('content', '')
+        reasoning_text = msg.get('reasoning_content', '')
+
+        # Combine — model may put everything in either field
+        combined = content_text if content_text and content_text.strip() else reasoning_text
+
+        # Extract answer: everything after </think>, or the whole thing if no think tags
+        if '</think>' in combined:
+            answer = combined.split('</think>')[-1].strip()
+        elif '<think>' in combined:
+            # Started thinking but never finished — try last few lines
+            lines = combined.replace('<think>', '').strip().split('\n')
+            answer = '\n'.join(lines[-3:]).strip() if len(lines) > 3 else combined.replace('<think>', '').strip()
+        else:
+            answer = combined
+
+        # Clean up
+        answer = answer.replace('<|im_end|>', '').replace('<|im_start|>', '')
+        answer = answer.replace('<think>', '').replace('</think>', '').strip()
+
+        return jsonify({'response': answer, 'status': 'success'})
+
+    except Exception as e:
+        logger.error(f"Vision query error: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/gpu/llm/vision/stream', methods=['POST'])
+def vision_query_stream():
+    """Stream vision analysis with thinking/answer separation"""
+    try:
+        data = request.get_json()
+        image_b64 = data.get('image')
+        question = data.get('question', 'What do you see in this image?')
+        max_tokens = data.get('max_tokens', 4096)
+
+        if not image_b64:
+            return jsonify({'error': 'No image provided (base64)'}), 400
+
+        logger.info(f"Vision stream query: {question[:80]}")
+
+        def generate():
+            try:
+                resp = http_requests.post(f"{LLAMA_SERVER_URL}/v1/chat/completions", json={
+                    'model': 'qwen3.5-9b',
+                    'messages': [
+                        {
+                            'role': 'system',
+                            'content': 'You are a marine engineering diagram analyst. Study the image carefully. Give a direct, specific answer in 1-4 sentences. No preamble, no over-explanation.'
+                        },
+                        {
+                            'role': 'user',
+                            'content': [
+                                {'type': 'image_url', 'image_url': {'url': f'data:image/jpeg;base64,{image_b64}'}},
+                                {'type': 'text', 'text': question}
+                            ]
+                        }
+                    ],
+                    'max_tokens': max_tokens,
+                    'temperature': 0.6,
+                    'top_p': 0.8,
+                    'top_k': 20,
+                    'presence_penalty': 1.5,
+                    'repeat_penalty': 1.0,
+                    'stream': True,
+                }, stream=True, timeout=300)
+                resp.raise_for_status()
+
+                # Collect the FULL response first, then parse
+                # Qwen3.5 vision: content may be empty, everything in reasoning_content
+                # OR content has <think>...</think> then answer
+                # OR reasoning_content has thinking, content has answer
+                full_text = ""           # Everything from content field
+                reasoning_text = ""      # Everything from reasoning_content field
+
+                for line in resp.iter_lines():
+                    if not line:
+                        continue
+                    line_str = line.decode('utf-8')
+                    if not line_str.startswith('data: '):
+                        continue
+                    if line_str.strip() == 'data: [DONE]':
+                        break
+
+                    chunk = json.loads(line_str[6:])
+                    delta = chunk.get('choices', [{}])[0].get('delta', {})
+                    content = delta.get('content', '')
+                    reasoning = delta.get('reasoning_content', '')
+
+                    if content:
+                        full_text += content
+                    if reasoning:
+                        reasoning_text += reasoning
+
+                logger.info(f"VISION RAW: content={len(full_text)} chars, reasoning={len(reasoning_text)} chars")
+
+                # === EXTRACT ANSWER from wherever the model put it ===
+                # Combine everything into one blob and parse
+                combined = ""
+                if full_text.strip():
+                    combined = full_text
+                elif reasoning_text.strip():
+                    combined = reasoning_text
+
+                # Now split thinking from answer
+                thinking_part = ""
+                answer_part = ""
+
+                if '</think>' in combined:
+                    # Clean split — everything before </think> is thinking, after is answer
+                    parts = combined.split('</think>', 1)
+                    thinking_part = parts[0].replace('<think>', '').strip()
+                    answer_part = parts[1].strip()
+                elif '<think>' in combined:
+                    # Has <think> but no </think> — model ran out of tokens mid-thinking
+                    # Try to find the last coherent sentence as answer
+                    without_think = combined.replace('<think>', '')
+                    # Look for the last paragraph break or sentence
+                    lines = without_think.strip().split('\n')
+                    if len(lines) > 3:
+                        # Last few lines might be the answer attempt
+                        answer_part = '\n'.join(lines[-3:]).strip()
+                        thinking_part = '\n'.join(lines[:-3]).strip()
+                    else:
+                        answer_part = without_think.strip()
+                else:
+                    # No think tags at all — entire thing is the answer
+                    answer_part = combined.strip()
+
+                # Clean up special tokens
+                answer_part = answer_part.replace('<|im_end|>', '').replace('<|im_start|>', '')
+                answer_part = answer_part.replace('<think>', '').replace('</think>', '').strip()
+
+                logger.info(f"VISION FINAL: thinking={len(thinking_part)} chars, answer={len(answer_part)} chars")
+                logger.info(f"VISION ANSWER: {answer_part[:300]}")
+
+                # Send thinking to thinking box
+                if thinking_part:
+                    yield f"data: {json.dumps({'type': 'thinking', 'content': thinking_part[:2000]})}\n\n"
+
+                # Stream the answer in chunks
+                if answer_part:
+                    chunk_size = 20
+                    for i in range(0, len(answer_part), chunk_size):
+                        yield f"data: {json.dumps({'type': 'answer', 'content': answer_part[i:i+chunk_size]})}\n\n"
+                else:
+                    yield f"data: {json.dumps({'type': 'answer', 'content': 'Could not analyze the image. Please try again with a clearer image.'})}\n\n"
+
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+            except Exception as e:
+                logger.error(f"Vision stream error: {e}")
+                yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+        return Response(generate(), mimetype='text/event-stream',
+                        headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache'})
+
+    except Exception as e:
+        logger.error(f"Error in vision stream: {e}")
+        return jsonify({'error': str(e)}), 500
+
 
 @app.route('/gpu/stt/transcribe', methods=['POST'])
 def transcribe_audio():
@@ -998,7 +1277,7 @@ def health_check():
             'gpu_available': gpu_available,
             'gpu_memory_gb': round(gpu_memory / (1024**3), 2) if gpu_memory else 0,
             'models_loaded': {
-                'llm': llm is not None,
+                'llm': True,  # llama-server runs separately
                 'whisper': whisper_model is not None,
                 'face_recognition': face_app is not None
             }
@@ -1006,7 +1285,32 @@ def health_check():
     except Exception as e:
         return jsonify({'status': 'error', 'error': str(e)}), 500
 
+@app.route('/gpu/debug', methods=['GET'])
+def debug_info():
+    """Debug endpoint — shows llama-server version, config, and reasoning-budget status"""
+    info = {'gpu_llama_status': 'running'}
+    try:
+        resp = http_requests.get(f"{LLAMA_SERVER_URL}/health", timeout=5)
+        info['llama_server_health'] = resp.status_code
+    except:
+        info['llama_server_health'] = 'unreachable'
+
+    try:
+        resp2 = http_requests.get(f"{LLAMA_SERVER_URL}/props", timeout=5)
+        info['llama_server_props'] = resp2.json() if resp2.status_code == 200 else 'N/A'
+    except:
+        info['llama_server_props'] = 'error'
+
+    try:
+        resp3 = http_requests.get(f"{LLAMA_SERVER_URL}/v1/models", timeout=5)
+        info['llama_server_models'] = resp3.json() if resp3.status_code == 200 else 'N/A'
+    except:
+        info['llama_server_models'] = 'error'
+
+    return jsonify(info)
+
 # ============= STARTUP =============
 if __name__ == '__main__':
     logger.info("Starting GPU Service (GGUF mode)...")
+    check_llama_server_info()
     app.run(host='0.0.0.0', port=5005, debug=False)
