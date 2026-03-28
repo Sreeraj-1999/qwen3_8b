@@ -310,41 +310,58 @@ def execute_tool_call(tool_name: str, arguments: dict) -> str:
         return json.dumps({"error": str(e)})
 
 
+def _parse_single_tool(tool_content: str):
+    """Parse a single tool call content block"""
+    import re
+    tool_content = tool_content.strip()
+
+    # Try JSON format first (Qwen3 style): {"name": "...", "arguments": {...}}
+    try:
+        parsed = json.loads(tool_content)
+        return parsed.get("name"), parsed.get("arguments", {})
+    except json.JSONDecodeError:
+        pass
+
+    # Try XML format (Qwen3.5 style): <function=name><parameter=key>value</parameter></function>
+    func_match = re.search(r'<function=(\w+)>', tool_content)
+    if func_match:
+        func_name = func_match.group(1)
+        params = {}
+        param_matches = re.findall(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', tool_content, re.DOTALL)
+        for param_name, param_value in param_matches:
+            param_value = param_value.strip()
+            try:
+                params[param_name] = json.loads(param_value)
+            except (json.JSONDecodeError, ValueError):
+                params[param_name] = param_value
+        return func_name, params
+
+    return None, None
+
+
 def parse_tool_call(response_text: str):
-    """Parse <tool_call> from model response — supports both JSON and Qwen3.5 XML format"""
+    """Parse first <tool_call> from model response (backward compatible)"""
     if "<tool_call>" not in response_text:
         return None, None
-
     try:
-        tool_content = response_text.split("<tool_call>")[1].split("</tool_call>")[0].strip()
-
-        # Try JSON format first (Qwen3 style): {"name": "...", "arguments": {...}}
-        try:
-            parsed = json.loads(tool_content)
-            return parsed.get("name"), parsed.get("arguments", {})
-        except json.JSONDecodeError:
-            pass
-
-        # Try XML format (Qwen3.5 style): <function=name><parameter=key>value</parameter></function>
-        import re
-        func_match = re.search(r'<function=(\w+)>', tool_content)
-        if func_match:
-            func_name = func_match.group(1)
-            params = {}
-            param_matches = re.findall(r'<parameter=(\w+)>\s*(.*?)\s*</parameter>', tool_content, re.DOTALL)
-            for param_name, param_value in param_matches:
-                # Try to parse as int/float/json, otherwise keep as string
-                param_value = param_value.strip()
-                try:
-                    params[param_name] = json.loads(param_value)
-                except (json.JSONDecodeError, ValueError):
-                    params[param_name] = param_value
-            return func_name, params
-
-        return None, None
+        tool_content = response_text.split("<tool_call>")[1].split("</tool_call>")[0]
+        return _parse_single_tool(tool_content)
     except (IndexError) as e:
         logger.error(f"Failed to parse tool call: {e}")
         return None, None
+
+
+def parse_all_tool_calls(response_text: str):
+    """Parse ALL <tool_call> blocks from model response. Returns list of (name, args) tuples."""
+    import re
+    calls = []
+    # Find all <tool_call>...</tool_call> blocks
+    blocks = re.findall(r'<tool_call>(.*?)</tool_call>', response_text, re.DOTALL)
+    for block in blocks:
+        name, args = _parse_single_tool(block)
+        if name:
+            calls.append((name, args))
+    return calls
 
 
 def needs_tool_call(question: str, imo: str = None) -> bool:

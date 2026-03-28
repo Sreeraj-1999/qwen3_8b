@@ -59,7 +59,7 @@ from flask import Flask, request, jsonify, Response
 import queue
 import threading
 import torch
-from mcp_tool_handler import TELEMETRY_TOOLS, PMS_TOOLS, ALL_TOOLS, execute_tool_call, parse_tool_call, needs_tool_call
+from mcp_tool_handler import TELEMETRY_TOOLS, PMS_TOOLS, ALL_TOOLS, execute_tool_call, parse_tool_call, parse_all_tool_calls, needs_tool_call
 
 import soundfile as sf
 import io
@@ -288,13 +288,6 @@ def generate_llm_response():
             Current year is 2026. When querying time ranges, use 2026.
             When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
             Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
-            # messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
-            # Current year is 2026. When querying time ranges, use 2026.
-            # When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
-            # Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
-            # messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
-            # Current year is 2026. When querying time ranges, use 2026.
-            # Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
 
         if not messages:
             return jsonify({'error': 'No messages provided'}), 400
@@ -344,22 +337,38 @@ def generate_llm_response():
         gen_temp = 0.7
         response = gguf_generate(text, max_tokens=max_tok, temperature=gen_temp)
         if "<tool_call>" in response:
-            tool_name, tool_args = parse_tool_call(response)
-            if tool_name:
-                tool_result = execute_tool_call(tool_name, tool_args)
-                
+            # Parse ALL tool calls (supports 1 or many)
+            tool_calls = parse_all_tool_calls(response)
+            if tool_calls:
+                # Execute tools in parallel
+                from concurrent.futures import ThreadPoolExecutor
+                tool_results = {}
+
+                def run_tool(name, args):
+                    return name, execute_tool_call(name, args)
+
+                with ThreadPoolExecutor(max_workers=max(len(tool_calls), 1)) as executor:
+                    futures = [executor.submit(run_tool, name, args) for name, args in tool_calls]
+                    for f in futures:
+                        name, result = f.result()
+                        tool_results[name] = result
+
                 with open('tool_debug.txt', 'w', encoding='utf-8') as f:
                     f.write("=== MODEL FIRST RESPONSE ===\n")
                     f.write(response + "\n\n")
-                    f.write("=== TOOL CALLED ===\n")
-                    f.write(f"Name: {tool_name}\n")
-                    f.write(f"Args: {json.dumps(tool_args, indent=2)}\n\n")
-                    f.write("=== TOOL RESULT ===\n")
-                    f.write(tool_result + "\n\n")
+                    for name, args in tool_calls:
+                        f.write(f"=== TOOL: {name} ===\n")
+                        f.write(f"Args: {json.dumps(args, indent=2)}\n")
+                        f.write(f"Result: {tool_results.get(name, 'N/A')[:2000]}\n\n")
                 logger.info(f"Tool debug written to tool_debug.txt")
 
+                # Combine all results
+                combined_results = ""
+                for name, args in tool_calls:
+                    combined_results += f"\n--- {name} result ---\n{tool_results[name]}\n"
+
                 messages.append({"role": "assistant", "content": response.replace("<|im_end|>", "").strip()})
-                messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data. List ALL items completely."})
+                messages.append({"role": "user", "content": f"Tool results:\n{combined_results}\n\nAnswer the original question based on ALL the data above. List ALL items completely."})
 
                 text2 = tokenizer.apply_chat_template(
                     messages, tokenize=False,
@@ -369,31 +378,6 @@ def generate_llm_response():
                 text2 = text2.replace('<think>', '').replace('</think>', '')
                 text2 = truncate_prompt_to_fit(text2, max_gen_tokens=4096)
                 response = gguf_generate(text2, max_tokens=4096, temperature=0.7)
-
-        # Tool call loop (max 1 round)
-        # if "<tool_call>" in response:
-        #     tool_name, tool_args = parse_tool_call(response)
-        #     if tool_name:
-        #         tool_result = execute_tool_call(tool_name, tool_args)
-        #         with open('tool_debug.txt', 'w', encoding='utf-8') as f:
-        #             f.write("=== MODEL FIRST RESPONSE ===\n")
-        #             f.write(response + "\n\n")
-        #             f.write("=== TOOL CALLED ===\n")
-        #             f.write(f"Name: {tool_name}\n")
-        #             f.write(f"Args: {json.dumps(tool_args, indent=2)}\n\n")
-        #             f.write("=== TOOL RESULT ===\n")
-        #             f.write(tool_result + "\n\n")
-        #         logger.info(f"Tool debug written to tool_debug.txt")
-
-        #         messages.append({"role": "assistant", "content": response.replace("<|im_end|>", "").strip()})
-        #         messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data."})
-
-        #         text2 = tokenizer.apply_chat_template(
-        #             messages, tokenize=False,
-        #             add_generation_prompt=True, enable_thinking=False
-        #         )
-
-        #         response = gguf_generate(text2, max_tokens=1024, temperature=0.7)
 
         # Clean
         if "</think>" in response:
@@ -592,9 +576,6 @@ TOOL USAGE RULES:
 
 When reporting vessel position always use the 'current_location' field (human readable place name) instead of raw latitude/longitude coordinates.
 Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
-            # messages[0]['content'] += f""" You are currently monitoring vessel IMO {imo}. Always use this IMO when calling tools.
-            # Current year is 2026. When querying time ranges, use 2026.
-            # Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (ME fuel consumption), AE_FMS_act_kgPh@AVG (AE fuel), V_SOG_act_kn@AVG (speed), ME_Load@AVG (ME load %), ME_SCAV_AIR_PRESS (scav air pressure), ME_NO_1_TC_RPM (TC1 RPM), ME_NO_2_TC_RPM (TC2 RPM). VesselTimeStamp is unix epoch."""
 
         if not messages:
             return jsonify({'error': 'No messages provided'}), 400
@@ -629,131 +610,141 @@ Key sensor names: ME_RPM, SA_POW_act_kW@AVG (shaft power), ME_FMS_act_kgPh@AVG (
 
         def generate():
             try:
-                user_question = ""
-                for m in reversed(messages):
-                    if m['role'] == 'user':
-                        user_question = m['content']
-                        break
+                stream_start = time.time()
 
-                likely_tool = bool(tools)
-                logger.info(f"DEBUG TOOL - user_question: '{user_question[:100]}', tools: {bool(tools)}, likely_tool: {likely_tool}")
+                # === PASS 1: Stream model response, detect tool calls ===
+                text = tokenizer.apply_chat_template(
+                    messages, tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                    tools=tools
+                )
+                text = text.replace('<think>\n\n</think>\n\n', '')
+                text = text.replace('<think>', '').replace('</think>', '')
 
-                if likely_tool:
-                    logger.info(f"DEBUG PATH A - generating with tool detection")
-                    # === PATH A: Tool detection — /completion with enable_thinking=False ===
-                    text = tokenizer.apply_chat_template(
-                        messages, tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=False,
-                        tools=tools
-                    )
-                    # Strip <think> tags — model generates "/" when it sees them
-                    text = text.replace('<think>\n\n</think>\n\n', '')
-                    text = text.replace('<think>', '').replace('</think>', '')
-                    response = gguf_generate(text, max_tokens=4096, temperature=0.7)
+                logger.info(f"=== STREAM-CHAT: generating (pass 1) ===")
 
-                    if "<tool_call>" in response:
-                        tool_name, tool_args = parse_tool_call(response)
-                        if tool_name:
-                            # Send friendly status message
-                            status_msg = TOOL_STATUS_MESSAGES.get(tool_name, 'Processing your request...')
+                # Stream Pass 1 — collect everything but start streaming immediately
+                # if model doesn't call tools
+                pass1_buffer = ""
+                has_tool_call = False
+
+                for token in gguf_stream(text, max_tokens=4096, temperature=0.7):
+                    pass1_buffer += token
+                    # Early tool detection — as soon as we see <tool_call> we know
+                    if "<tool_call>" in pass1_buffer and not has_tool_call:
+                        has_tool_call = True
+
+                elapsed_p1 = time.time() - stream_start
+                logger.info(f"=== STREAM-CHAT PASS1: {len(pass1_buffer)} chars, tool_call={has_tool_call}, time={elapsed_p1:.1f}s ===")
+
+                if has_tool_call:
+                    # === TOOL CALL PATH: parse ALL tool calls, execute in parallel ===
+                    tool_calls = parse_all_tool_calls(pass1_buffer)
+                    logger.info(f"=== TOOL CALLS DETECTED: {len(tool_calls)} — {[tc[0] for tc in tool_calls]} ===")
+
+                    if tool_calls:
+                        # Send status messages for each tool
+                        for tool_name, _ in tool_calls:
+                            status_msg = TOOL_STATUS_MESSAGES.get(tool_name, f'Calling {tool_name}...')
                             yield f"data: {json.dumps({'type': 'tool_status', 'content': status_msg})}\n\n"
 
-                            # Execute the tool
-                            tool_result = execute_tool_call(tool_name, tool_args)
+                        # Execute tools in parallel using threads
+                        from concurrent.futures import ThreadPoolExecutor
+                        tool_results = {}
 
-                            with open('tool_debug.txt', 'w', encoding='utf-8') as f:
-                                f.write("=== MODEL FIRST RESPONSE ===\n")
-                                f.write(response + "\n\n")
-                                f.write("=== TOOL CALLED ===\n")
-                                f.write(f"Name: {tool_name}\n")
-                                f.write(f"Args: {json.dumps(tool_args, indent=2)}\n\n")
-                                f.write("=== TOOL RESULT ===\n")
-                                f.write(tool_result + "\n\n")
-                            logger.info(f"Tool debug written to tool_debug.txt")
+                        def run_tool(name, args):
+                            return name, execute_tool_call(name, args)
 
-                            # Build Pass 2 messages
-                            pass2_messages = list(messages)
-                            pass2_messages.append({"role": "assistant", "content": response.replace("<|im_end|>", "").strip()})
-                            pass2_messages.append({"role": "user", "content": f"Tool result:\n{tool_result}\n\nAnswer the original question based on this data. List ALL items completely."})
+                        with ThreadPoolExecutor(max_workers=len(tool_calls)) as executor:
+                            futures = [executor.submit(run_tool, name, args) for name, args in tool_calls]
+                            for f in futures:
+                                name, result = f.result()
+                                tool_results[name] = result
 
-                            # === PASS 2: Stream the final answer (no thinking) ===
-                            text2 = tokenizer.apply_chat_template(
-                                pass2_messages, tokenize=False,
-                                add_generation_prompt=True, enable_thinking=False
-                            )
-                            # Strip <think> tags
-                            text2 = text2.replace('<think>\n\n</think>\n\n', '')
-                            text2 = text2.replace('<think>', '').replace('</think>', '')
-                            text2 = truncate_prompt_to_fit(text2, max_gen_tokens=4096)
+                        # Debug log
+                        with open('tool_debug.txt', 'w', encoding='utf-8') as f:
+                            f.write("=== MODEL FIRST RESPONSE ===\n")
+                            f.write(pass1_buffer + "\n\n")
+                            for name, args in tool_calls:
+                                f.write(f"=== TOOL: {name} ===\n")
+                                f.write(f"Args: {json.dumps(args, indent=2)}\n")
+                                f.write(f"Result: {tool_results.get(name, 'N/A')[:2000]}\n\n")
+                        logger.info(f"Tool debug written to tool_debug.txt")
 
-                            # Collect then send — strips all think tags reliably
-                            pass2_buffer = ""
-                            for token in gguf_stream(text2, max_tokens=4096, temperature=0.7):
-                                pass2_buffer += token
+                        # Build Pass 2 — combine all tool results
+                        combined_results = ""
+                        for name, args in tool_calls:
+                            combined_results += f"\n--- {name} result ---\n{tool_results[name]}\n"
 
-                            # Strip any thinking that leaked despite enable_thinking=False
-                            if "</think>" in pass2_buffer:
-                                pass2_buffer = pass2_buffer.split("</think>")[-1]
-                            pass2_buffer = pass2_buffer.replace("<think>", "").replace("</think>", "")
-                            pass2_buffer = pass2_buffer.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+                        pass2_messages = list(messages)
+                        pass2_messages.append({"role": "assistant", "content": pass1_buffer.replace("<|im_end|>", "").strip()})
+                        pass2_messages.append({"role": "user", "content": f"Tool results:\n{combined_results}\n\nAnswer the original question based on ALL the data above. List ALL items completely."})
 
-                            # Stream cleaned answer in chunks
-                            chunk_size = 6
-                            for i in range(0, len(pass2_buffer), chunk_size):
-                                chunk = pass2_buffer[i:i + chunk_size]
-                                if chunk:
-                                    yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
-                                    time.sleep(0.02)
+                        # === PASS 2: Stream final answer ===
+                        text2 = tokenizer.apply_chat_template(
+                            pass2_messages, tokenize=False,
+                            add_generation_prompt=True, enable_thinking=False
+                        )
+                        text2 = text2.replace('<think>\n\n</think>\n\n', '')
+                        text2 = text2.replace('<think>', '').replace('</think>', '')
+                        text2 = truncate_prompt_to_fit(text2, max_gen_tokens=4096)
 
-                            yield f"data: {json.dumps({'type': 'done'})}\n\n"
-                            return
+                        # Stream Pass 2 answer in real-time
+                        answer_buf = ""
+                        in_think = True
+                        raw = ""
+                        for token in gguf_stream(text2, max_tokens=4096, temperature=0.7):
+                            raw += token
+                            if in_think:
+                                if '</think>' in raw:
+                                    in_think = False
+                                    raw = raw.split('</think>', 1)[1]
+                                    clean = raw.replace('<|im_end|>', '').replace('<|im_start|>', '')
+                                    if clean.strip():
+                                        answer_buf += clean
+                                        yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+                                    raw = ""
+                                elif '<think>' not in raw and '\n' not in raw[:5]:
+                                    # No think tags at all — stream directly
+                                    in_think = False
+                                    clean = raw.replace('<|im_end|>', '').replace('<|im_start|>', '')
+                                    clean = clean.replace('<think>', '').replace('</think>', '')
+                                    if clean.strip():
+                                        answer_buf += clean
+                                        yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
+                                    raw = ""
+                            else:
+                                clean = token.replace('<|im_end|>', '').replace('<|im_start|>', '')
+                                clean = clean.replace('<think>', '').replace('</think>', '')
+                                if clean:
+                                    answer_buf += clean
+                                    yield f"data: {json.dumps({'type': 'answer', 'content': clean})}\n\n"
 
-                    # Tool was expected but model didn't call one — send response as stream
-                    if "</think>" in response:
-                        response = response.split("</think>")[-1]
-                    response = response.replace("<think>", "").replace("</think>", "")
-                    response = response.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
+                        elapsed = time.time() - stream_start
+                        logger.info(f"=== STREAM-CHAT DONE (tools): answer={len(answer_buf)} chars, time={elapsed:.1f}s ===")
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
 
-                    # Send in reasonable chunks
-                    chunk_size = 6
-                    for i in range(0, len(response), chunk_size):
-                        chunk = response[i:i + chunk_size]
-                        if chunk:
-                            yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
-                            time.sleep(0.03)
+                # === NO TOOL CALL: stream the response directly ===
+                # Clean up pass1_buffer and stream it
+                response = pass1_buffer
+                if "</think>" in response:
+                    response = response.split("</think>")[-1]
+                response = response.replace("<think>", "").replace("</think>", "")
+                response = response.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
 
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                # Stream in chunks (fast — no sleep needed, already generated)
+                chunk_size = 8
+                for i in range(0, len(response), chunk_size):
+                    chunk = response[i:i + chunk_size]
+                    if chunk:
+                        yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
+                        time.sleep(0.015)
 
-                else:
-                    logger.info(f"DEBUG PATH B - direct streaming, no tools")
-                    # === PATH B: No tools — collect + strip thinking ===
-                    text = tokenizer.apply_chat_template(
-                        messages, tokenize=False,
-                        add_generation_prompt=True,
-                        enable_thinking=False
-                    )
-                    # Strip <think> tags
-                    text = text.replace('<think>\n\n</think>\n\n', '')
-                    text = text.replace('<think>', '').replace('</think>', '')
-
-                    pathb_buffer = ""
-                    for token in gguf_stream(text, max_tokens=4096, temperature=0.7):
-                        pathb_buffer += token
-
-                    if "</think>" in pathb_buffer:
-                        pathb_buffer = pathb_buffer.split("</think>")[-1]
-                    pathb_buffer = pathb_buffer.replace("<think>", "").replace("</think>", "")
-                    pathb_buffer = pathb_buffer.replace("<|im_end|>", "").replace("<|im_start|>", "").strip()
-
-                    chunk_size = 6
-                    for i in range(0, len(pathb_buffer), chunk_size):
-                        chunk = pathb_buffer[i:i + chunk_size]
-                        if chunk:
-                            yield f"data: {json.dumps({'type': 'answer', 'content': chunk})}\n\n"
-                            time.sleep(0.02)
-
-                    yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                elapsed = time.time() - stream_start
+                logger.info(f"=== STREAM-CHAT DONE (no tools): answer={len(response)} chars, time={elapsed:.1f}s ===")
+                yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
             except Exception as e:
                 logger.error(f"Stream-chat error: {e}")
