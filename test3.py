@@ -23,7 +23,8 @@ from datetime import datetime
 from collections import defaultdict
 import gc
 import pdfplumber
-from langchain.schema import Document
+# from langchain.schema import Document
+from langchain_core.documents import Document
 import torch
 
 from unstructured.partition.pdf import partition_pdf
